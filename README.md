@@ -13,9 +13,9 @@ The impact of marine heatwaves (MHWs) on ecosystem functions and services remain
 
 ### Specific input files used for this manuscript are provided in this repository.
 
-_Argo float data and code directory:_
+[Argo float data and code directory](https://github.com/hallamlab/NESAP_marine_heatwaves/tree/main/argo/)
 
-_Phytoplankton pigments data and code directory:_
+[Phytoplankton pigments data and code](https://github.com/hallamlab/NESAP_marine_heatwaves/tree/main/pigments)
 
-_16S and 18S rRNA gene DNA metabarcoding data and code directory:_ 
+[16S and 18S rRNA gene DNA metabarcoding data and code directory](https://github.com/hallamlab/NESAP_marine_heatwaves/tree/main/metabarcoding) 
 
