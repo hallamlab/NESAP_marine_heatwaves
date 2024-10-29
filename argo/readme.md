@@ -1,1 +1,1 @@
-Find the data and code used to analyze BGC-Argo float data here.
+Find the BGC-Argo float data and analysis code here.
