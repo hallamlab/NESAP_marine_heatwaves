@@ -11,7 +11,7 @@ The impact of marine heatwaves (MHWs) on ecosystem functions and services remain
 - DNA metabarcoding data is available on the NCBI SRA under the BioProjects: PRJNA639229 (https://www.ncbi.nlm.nih.gov/bioproject/PRJNA639229/) and PRJNA640752 (https://www.ncbi.nlm.nih.gov/bioproject/PRJNA640752/).
 
 
-### Specific input files used for this manuscript are provided in this repository.
+### Specific input files used for this manuscript are linked below:
 
 [Argo float data and code directory](https://github.com/hallamlab/NESAP_marine_heatwaves/tree/main/argo/)
 
