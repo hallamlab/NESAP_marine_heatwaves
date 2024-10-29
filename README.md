@@ -13,18 +13,9 @@ The impact of marine heatwaves (MHWs) on ecosystem functions and services remain
 
 ### Specific input files used for this manuscript are provided in this repository.
 
-_Argo Data_
-- BGC-Argo float input data file:
-- BGC-Argo float data analysis code:
+_Argo float data and code directory:_
 
-_Phytoplankton pigments data_
-- HPLC-Pigments input data file:
-- HPLC-Pigments data analysis code:
+_Phytoplankton pigments data and code directory:_
 
-_16S and 18S rRNA gene DNA metabarcoding data_
-- 16S-V4V5 DNA metabarcoding input data file:
-- 18S-V4 DNA metabarcoding input data file:
-- DNA metabarcoding data analysis file:
-
-- Compilation of scripts used for bioinformatic processing of raw DNA metabarcoding data:
+_16S and 18S rRNA gene DNA metabarcoding data and code directory:_ 
 
