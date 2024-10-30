@@ -12,6 +12,7 @@ The impact of marine heatwaves (MHWs) on ecosystem functions and services remain
 
 
 ### Specific input files used for this manuscript are linked below:
+_(note: As of 29 Oct 2024, we are still adding data and code to this repository; to be completed soon.)_
 
 [Argo float data and analysis code](https://github.com/hallamlab/NESAP_marine_heatwaves/tree/main/argo/)
 
