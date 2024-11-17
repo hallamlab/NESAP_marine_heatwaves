@@ -1,0 +1,1524 @@
+---
+title: "Line P 16S and 18S Metabarcoding Data Analysis"
+author: "Colleen Kellogg, Hakai Institute"
+output: 
+  rmarkdown::html_document:
+    theme: lumen
+    toc: true
+    toc_depth: 4
+    toc_float: true
+    
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(devtools)
+library(phyloseq)
+library(data.table)
+library(lubridate)
+library(RColorBrewer)
+library(colorspace)
+library(ggsci)
+library(microViz)
+library(factoextra)
+library(ggfortify)
+library(ggrepel)
+library(microbiome)
+library(metacoder)
+library(metagMisc)
+library(ggpubr)
+library(cowplot)
+library(microbiome)
+library(fantaxtic)
+library(pairwiseAdonis)
+
+```
+
+We are using 2 types of biological data in this manuscript: HPLC pigments and metabarcoding (16S rRNA gene and 18S rRNA gene amplicon sequencing) data. 
+
+This file details the analysis of the metabarcoding data
+
+### 16S V4V5 rRNA gene amplicon sequencing (metabarcoding) data
+
+#### Load 16S data, make phyloseq object, and clean it up
+
+```{R load prokaryotic data, warning = FALSE, results = FALSE}
+
+pasvfile <-as.matrix(read.csv("osp-proks-V4V5-full-2023-asvtable.csv", row.names=1, header = TRUE))
+
+ptaxfile <-as.matrix(read.csv("silva-taxonomy-proks-2023.csv",row.names=1,header = TRUE))
+
+pmapfile <-read.csv("OSP-metadata-prok.csv", row.names = 1, header=TRUE)
+
+pmapfile$Date <- as.Date(pmapfile$Date, format="%Y-%m-%d")
+
+#### make phyloseq object ####
+
+check <- match(rownames(pmapfile), colnames(pasvfile))
+# check
+
+pOTU = otu_table(pasvfile, taxa_are_rows = TRUE)
+pTAX = tax_table(ptaxfile)
+pMAP = sample_data(pmapfile)
+#TRE = phy_tree(treefile)
+
+#physeq_hmic = merge_phyloseq(OTU, TAX, MAP,TRE) #This is the phyloseq object for the prokaryotic data
+osp_prok_all = merge_phyloseq(pOTU, pTAX, pMAP)
+
+#### create surface dataset, because that is the focus of the manuscript ####
+osp_prok <- osp_prok_all %>% subset_samples(Depth %in% c(10, 25, 50, 100, 150, 200, 300))
+
+osp_prok = prune_taxa(taxa_sums(osp_prok) > 0, osp_prok) #removes empty asvs now that we aren't looking at deep samples
+
+osp_prok_sum_table <- data.table(as(sample_data(osp_prok), "data.frame"),
+                 TotalReads = sample_sums(osp_prok), keep.rownames = TRUE)
+
+min(osp_prok_sum_table$TotalReads) #5059
+mean(osp_prok_sum_table$TotalReads) #119853
+median(osp_prok_sum_table$TotalReads) #106495
+
+ggplot(osp_prok_sum_table, aes(x=TotalReads)) + geom_histogram(color = "purple", fill = "white", bins = 100) + labs(x="Total Reads", y= "Count", title="Distribution of Read Depth of OSP Prokaryotes")
+
+#### remove samples with low read counts ####
+osp_prok_pruned<-prune_samples(sample_sums(osp_prok) > 50000, osp_prok) 
+
+#### let's breakdown proteobacteria in the Phylum taxonomic level ####
+osp_prok_pruned1 = osp_prok_pruned #create a new phyloseq object, so the old isn't disrupted
+
+plot.tax = as.data.frame(tax_table(osp_prok_pruned))
+plot.tax = data.frame(lapply(plot.tax, as.character), stringsAsFactors = F)
+plot.tax$Phylum[plot.tax$Phylum=="Proteobacteria"] = plot.tax$Class[plot.tax$Phylum=="Proteobacteria"] 
+plot.tax[] = lapply(plot.tax, factor)
+plot.tax.table = tax_table(plot.tax)
+rownames(plot.tax.table) = rownames(tax_table(osp_prok_pruned))
+colnames(plot.tax.table) = colnames(tax_table(osp_prok_pruned))
+identical(plot.tax.table[1:3058,3:7], tax_table(osp_prok_pruned)[1:3058,3:7]) #final check; should be true. Ensure the number of rows is adjusted to the dimensions of your tax table. 
+tax_table(osp_prok_pruned) = plot.tax.table
+
+unique(data.frame(tax_table(osp_prok_pruned1))$Phylum) #only proteos
+unique(data.frame(tax_table(osp_prok_pruned))$Phylum) #separate proteos, but this creates any 'empty' phylum (which is simply unclassified proteobacteria)
+
+osp_prok_pruned2 <- osp_prok_pruned
+
+#### update taxonomy file so there aren't holes, using microViz package ####
+osp_prok_fix1 <-osp_prok_pruned2 %>% 
+ tax_fix(
+  min_length = 4,
+  unknowns = c("", "NA","unknown","uncultured","Incertae_Sedis"),
+  sep = " ", anon_unique = TRUE,
+  suffix_rank = "classified"
+ )
+
+osp_prok_fix<-osp_prok_fix1 %>% tax_select(tax_list = "Bacteria Domain", deselect = TRUE) #get rid of ASVs that cannot be annotated beyond bacteria
+
+```
+
+#### Look at differences in diversity and read depth among MiSeq runs
+The read depth was quite a bit greater for the JGI runs. How does this impact the dataset and can we mitigate this? 
+
+From the analysis below it is is clear that observed diversity (#ASVs) differs by sequencing run, but shannon diversity is less dramatic and, (basic phyloseq) rarefaction doesn't seem to make a difference (i.e. plots look near identical). 
+
+So we tried a variety of different methods to filter the 16S prokaryotic dataset to mitigate these sequencing run differences.
+
+
+```{R dig into sequencing run differences, warning = FALSE}
+#### is there a relationship between sequencing depth or sequencing run and diversity? ####
+ggplot(data = data.frame("total_reads" =  phyloseq::sample_sums(osp_prok_fix),
+                         "observed" = phyloseq::estimate_richness(osp_prok_fix, measures = "Observed")[, 1]),
+       aes(x = total_reads, y = observed)) +
+  geom_point() +
+  geom_smooth(method="lm", se = FALSE) +
+  labs(x = "\nTotal Reads", y = "Observed Richness\n")
+
+#ggsave("readsvsrichness.jpg",last_plot(),width = 5, height = 4)
+
+set.seed(123)
+pk_rare <- phyloseq::rarefy_even_depth(osp_prok_fix, rngseed = 123, replace = FALSE) #only removes 11 ASVs. leaving 3024.
+
+prich<-estimate_richness(osp_prok_fix, measures = c("Chao1", "Shannnon"))
+
+plot_richness(osp_prok_fix, x = "Seq.Run", measures=c("Chao1", "Shannon"))
+# ggsave("unrarefied-diversity.jpg",last_plot(),width = 8, height = 4)
+plot_richness(pk_rare, x = "Seq.Run", measures=c("Chao1", "Shannon"))
+# ggsave("rarefied-diversity.jpg",last_plot(),width = 8, height = 4)
+
+#rarefying doesn't improve the disparity by sequencing run. so use unrarefied.
+
+
+#it is clear that observed diversity (#ASVs) differs by sequencing run, but shannon diversity is less dramatic and, (basic phyloseq) rarefaction doesn't seem to make a difference (i.e. plots look near identical).
+
+
+#what happens if we use topf to filter ASV table in a variety of different ways.
+
+f1<-filterfun_sample(topf(0.8)) #top 80% of taxa
+wh1<-genefilter_sample(osp_prok_fix, f1, A=1)
+osp_prok_fix_topf<-prune_taxa(wh1,osp_prok_fix) #858 asvs
+
+f2<-filterfun_sample(topf(0.9)) #top 90% of taxa
+wh2<-genefilter_sample(osp_prok_fix, f2, A=1)
+osp_prok_fix_topf2<-prune_taxa(wh2,osp_prok_fix) #1528 asvs
+
+f3<-filterfun_sample(topp(0.05)) #the most abundant 5% of taxa
+wh3<-genefilter_sample(osp_prok_fix, f3, A=1)
+osp_prok_fix_topp<-prune_taxa(wh3,osp_prok_fix) #1397 asvs
+
+f4<-filterfun_sample(topp(0.01)) #the most abundant 1% of taxa
+wh4<-genefilter_sample(osp_prok_fix, f4, A=1)
+osp_prok_fix_topp4<-prune_taxa(wh4,osp_prok_fix) #228 asv
+
+# top_500 <- top_taxa(osp_prok_fix, n = 500)
+# 
+# top_1000 <- top_taxa(osp_prok_fix, n = 1000)
+# 
+# top_750 <- top_taxa(osp_prok_fix, n = 750)
+
+# to call the ps object. top_750$osp_prok_fix
+# plot_nested_bar(ps_obj = top_asv$ps_obj,
+#                 top_level = "Phylum",
+#                 nested_level = "Species")
+
+#what if we just do some basic min abun filters
+totalreads<-sum(osp_prok_sum_table$TotalReads)
+filterby = 0.0001*totalreads
+
+
+osp_prok_fix5k = prune_taxa(taxa_sums(osp_prok_fix) > 5000, osp_prok_fix) 
+osp_prok_fix2k = prune_taxa(taxa_sums(osp_prok_fix) > 2732, osp_prok_fix) 
+
+
+adiv_top <- data.frame( #top 80% of taxa
+  "Observed" = phyloseq::estimate_richness(osp_prok_fix_topf, measures = "Observed"),
+  "Shannon" = phyloseq::estimate_richness(osp_prok_fix_topf, measures = "Shannon"),
+  "SeqRun" = phyloseq::sample_data(osp_prok_fix_topf)$Seq.Run,
+  "Depth" = phyloseq::sample_data(osp_prok_fix_topf)$Depth,
+  "Month" = phyloseq::sample_data(osp_prok_fix_topf)$Month)
+
+adiv_top2 <- data.frame( #top 90% of taxa
+  "Observed" = phyloseq::estimate_richness(osp_prok_fix_topf2, measures = "Observed"),
+  "Shannon" = phyloseq::estimate_richness(osp_prok_fix_topf2, measures = "Shannon"),
+  "SeqRun" = phyloseq::sample_data(osp_prok_fix_topf2)$Seq.Run,
+  "Depth" = phyloseq::sample_data(osp_prok_fix_topf2)$Depth,
+  "Month" = phyloseq::sample_data(osp_prok_fix_topf2)$Month)
+
+#####
+adiv_topp <- data.frame( #the most abundant 5% of taxa
+  "Observed" = phyloseq::estimate_richness(osp_prok_fix_topp, measures = "Observed"),
+  "Shannon" = phyloseq::estimate_richness(osp_prok_fix_topp, measures = "Shannon"),
+  "SeqRun" = phyloseq::sample_data(osp_prok_fix_topp)$Seq.Run,
+  "Depth" = phyloseq::sample_data(osp_prok_fix_topp)$Depth,
+  "Month" = phyloseq::sample_data(osp_prok_fix_topp)$Month)
+
+adiv_topp4 <- data.frame( #the most abundant 1% of taxa
+  "Observed" = phyloseq::estimate_richness(osp_prok_fix_topp4, measures = "Observed"),
+  "Shannon" = phyloseq::estimate_richness(osp_prok_fix_topp4, measures = "Shannon"),
+  "SeqRun" = phyloseq::sample_data(osp_prok_fix_topp4)$Seq.Run,
+  "Depth" = phyloseq::sample_data(osp_prok_fix_topp4)$Depth,
+  "Month" = phyloseq::sample_data(osp_prok_fix_topp4)$Month)
+
+adiv_5k <- data.frame( #asv has to have at least 5k reads
+  "Observed" = phyloseq::estimate_richness(osp_prok_fix5k, measures = "Observed"),
+  "Shannon" = phyloseq::estimate_richness(osp_prok_fix5k, measures = "Shannon"),
+  "SeqRun" = phyloseq::sample_data(osp_prok_fix5k)$Seq.Run,
+  "Depth" = phyloseq::sample_data(osp_prok_fix5k)$Depth,
+  "Month" = phyloseq::sample_data(osp_prok_fix5k)$Month)
+
+adiv_2k <- data.frame( #asv has to have at least 2k reads
+  "Observed" = phyloseq::estimate_richness(osp_prok_fix2k, measures = "Observed"),
+  "Shannon" = phyloseq::estimate_richness(osp_prok_fix2k, measures = "Shannon"),
+  "SeqRun" = phyloseq::sample_data(osp_prok_fix2k)$Seq.Run,
+  "Depth" = phyloseq::sample_data(osp_prok_fix2k)$Depth,
+  "Month" = phyloseq::sample_data(osp_prok_fix2k)$Month)
+#####
+
+
+adiv_og<- data.frame( #original data frame before filtering applied
+  "Observed" = phyloseq::estimate_richness(osp_prok_fix, measures = "Observed"),
+  "Shannon" = phyloseq::estimate_richness(osp_prok_fix, measures = "Shannon"),
+  "SeqRun" = phyloseq::sample_data(osp_prok_fix)$Seq.Run,
+  "Depth" = phyloseq::sample_data(osp_prok_fix)$Depth,
+  "Month" = phyloseq::sample_data(osp_prok_fix)$Month)
+
+adiv_rare<- data.frame( #rarefied data frame
+  "Observed" = phyloseq::estimate_richness(pk_rare, measures = "Observed"),
+  "Shannon" = phyloseq::estimate_richness(pk_rare, measures = "Shannon"),
+  "SeqRun" = phyloseq::sample_data(pk_rare)$Seq.Run,
+  "Depth" = phyloseq::sample_data(pk_rare)$Depth,
+  "Month" = phyloseq::sample_data(pk_rare)$Month)
+
+
+adiv_top$Depth <- factor(adiv_top$Depth, levels = c("10","25","50","100","150","200","300"))
+
+adiv_top2$Depth <- factor(adiv_top2$Depth, levels = c("10","25","50","100","150","200","300"))
+
+adiv_topp$Depth <- factor(adiv_topp$Depth, levels = c("10","25","50","100","150","200","300"))
+
+adiv_topp4$Depth <- factor(adiv_topp4$Depth, levels = c("10","25","50","100","150","200","300"))
+
+adiv_5k$Depth <- factor(adiv_5k$Depth, levels = c("10","25","50","100","150","200","300"))
+
+adiv_2k$Depth <- factor(adiv_2k$Depth, levels = c("10","25","50","100","150","200","300"))
+
+adiv_og$Depth <- factor(adiv_og$Depth, levels = c("10","25","50","100","150","200","300"))
+
+adiv_rare$Depth <- factor(adiv_rare$Depth, levels = c("10","25","50","100","150","200","300"))
+
+
+adiv_og %>%
+  gather(key = metric, value = value, c("Observed", "Shannon")) %>%
+  mutate(metric = factor(metric, levels = c("Observed", "Shannon"))) %>%
+  ggplot(aes(x = factor(SeqRun), y = value, color = Depth)) +
+  geom_boxplot(outlier.color = NA) +
+ # geom_jitter(aes(color = Depth), height = 0, width = .2) +
+  labs(x = "Sequencing Run", y = "Diversity") +
+  facet_wrap(~ metric, scales = "free") +
+  theme(legend.position="bottom") +
+  ggtitle("Unfiltered diversity")
+
+# ggsave("diversity-depth.jpg",last_plot(),width = 8, height = 4)
+
+adiv_rare %>%
+  gather(key = metric, value = value, c("Observed", "Shannon")) %>%
+  mutate(metric = factor(metric, levels = c("Observed", "Shannon"))) %>%
+  ggplot(aes(x = factor(SeqRun), y = value, color = Depth)) +
+  geom_boxplot(outlier.color = NA) +
+ # geom_jitter(aes(color = Depth), height = 0, width = .2) +
+  labs(x = "Sequencing Run", y = "Diversity") +
+  facet_wrap(~ metric, scales = "free") +
+  theme(legend.position="bottom") +
+  ggtitle("Rarefied Diversity")
+
+# ggsave("rarefied-diversity-depth.jpg",last_plot(),width = 8, height = 4)
+
+#####
+adiv_2k %>%
+  gather(key = metric, value = value, c("Observed", "Shannon")) %>%
+  mutate(metric = factor(metric, levels = c("Observed", "Shannon"))) %>%
+  ggplot(aes(x = factor(SeqRun), y = value, color = Depth)) +
+  geom_boxplot(outlier.color = NA) +
+ # geom_jitter(aes(color = Depth), height = 0, width = .2) +
+  labs(x = "", y = "") +
+  facet_wrap(~ metric, scales = "free") +
+  theme(legend.position="bottom") +
+  ggtitle("ASVs with sums greater than 2700")
+
+adiv_5k %>%
+  gather(key = metric, value = value, c("Observed", "Shannon")) %>%
+  mutate(metric = factor(metric, levels = c("Observed", "Shannon"))) %>%
+  ggplot(aes(x = factor(SeqRun), y = value, color = Depth)) +
+  geom_boxplot(outlier.color = NA) +
+ # geom_jitter(aes(color = Depth), height = 0, width = .2) +
+  labs(x = "", y = "") +
+  facet_wrap(~ metric, scales = "free") +
+  theme(legend.position="bottom") +
+  ggtitle("ASVs with sums greater than 5000")
+#####
+
+adiv_top %>%
+  gather(key = metric, value = value, c("Observed", "Shannon")) %>%
+  mutate(metric = factor(metric, levels = c("Observed", "Shannon"))) %>%
+  ggplot(aes(x = factor(SeqRun), y = value, color = Depth)) +
+  geom_boxplot(outlier.color = NA) +
+ # geom_jitter(aes(color = Depth), height = 0, width = .2) +
+  labs(x = "", y = "") +
+  facet_wrap(~ metric, scales = "free") +
+  theme(legend.position="bottom") +
+  ggtitle("top 80% of taxa")
+
+# ggsave("top80percent-diversity-depth.jpg",last_plot(),width = 8, height = 4)
+
+adiv_top2 %>%
+  gather(key = metric, value = value, c("Observed", "Shannon")) %>%
+  mutate(metric = factor(metric, levels = c("Observed", "Shannon"))) %>%
+  ggplot(aes(x = factor(SeqRun), y = value, color = Depth)) +
+  geom_boxplot(outlier.color = NA) +
+ # geom_jitter(aes(color = Depth), height = 0, width = .2) +
+  labs(x = "", y = "") +
+  facet_wrap(~ metric, scales = "free") +
+  theme(legend.position="bottom") +
+  ggtitle("top 90% of taxa")
+
+# ggsave("top90percent-diversity-depth.jpg",last_plot(),width = 8, height = 4)
+
+#####
+adiv_topp %>%
+  gather(key = metric, value = value, c("Observed", "Shannon")) %>%
+  mutate(metric = factor(metric, levels = c("Observed", "Shannon"))) %>%
+  ggplot(aes(x = factor(SeqRun), y = value, color = Depth)) +
+  geom_boxplot(outlier.color = NA) +
+ # geom_jitter(aes(color = Depth), height = 0, width = .2) +
+  labs(x = "", y = "") +
+  facet_wrap(~ metric, scales = "free") +
+  theme(legend.position="bottom") +
+  ggtitle("top 5% most abundant taxa")
+
+adiv_topp4 %>%
+  gather(key = metric, value = value, c("Observed", "Shannon")) %>%
+  mutate(metric = factor(metric, levels = c("Observed", "Shannon"))) %>%
+  ggplot(aes(x = factor(SeqRun), y = value, color = Depth)) +
+  geom_boxplot(outlier.color = NA) +
+ # geom_jitter(aes(color = Depth), height = 0, width = .2) +
+  labs(x = "", y = "") +
+  facet_wrap(~ metric, scales = "free") +
+  theme(legend.position="bottom") +
+  ggtitle("top 1% most abundant data") #this changes the diversity patterns too much
+
+
+#topf = 0.8 [osp_prok_fix_topf] or top 750 or 1000 ASVs seem to bring shannon diveristy a bit closer together by run; reducing between run differences
+
+```
+
+topf = 0.8 [osp_prok_fix_topf] seems to bring shannon diveristy a bit closer together by run; reducing between run differences.
+
+
+#### Beta diversity: Prokaryotes
+
+```{R prokaryotic ordinations, warning = FALSE, results = FALSE}
+#proportion
+ospprokR = transform_sample_counts(osp_prok_fix_topf, function(x) x / sum(x) ) #top 80% of ASVs; 858 #asvs
+# ospprokR2 = transform_sample_counts(osp_prok_fix_topf2, function(x) x / sum(x) ) #top 90% ASVs; 1528 
+# #hellinger transformation
+# osp_prokH <- transform_sample_counts(osp_prok_fix, function(x) sqrt(x / sum(x)))
+
+
+#ordination
+
+set.seed(9)
+# pnmds2<-ospprokR2 %>% ordinate(method = "NMDS",distance = "bray", k = 3, trymax = 500 )
+pnmds<-ospprokR %>% ordinate(method = "NMDS",distance = "bray", k = 3, trymax = 500 )
+# pnmdsH<-osp_prokH %>% ordinate(method = "NMDS",distance = "bray", k = 3, trymax = 500 )
+
+
+sample_data(ospprokR)$Depth <- factor(sample_data(ospprokR)$Depth, levels = c("10","25","50","100","150","200","300"))
+sample_data(ospprokR)$Month_name <- factor(sample_data(ospprokR)$Month_name, levels = c("February","June","August"))
+sample_data(ospprokR)$Year <- factor(sample_data(ospprokR)$Year, levels = c("2010","2011","2012","2013","2014","2015","2016","2017","2018","2019"))
+sample_data(ospprokR)$Seq.Run <- factor(sample_data(ospprokR)$Seq.Run, levels = c("1","2","3","4","5"))
+
+# sample_data(ospprokR2)$Depth <- factor(sample_data(ospprokR2)$Depth, levels = c("10","25","50","100","150","200","300"))
+# sample_data(ospprokR2)$Month_name <- factor(sample_data(ospprokR2)$Month_name, levels = c("February","June","August"))
+# sample_data(ospprokR2)$Year <- factor(sample_data(ospprokR2)$Year, levels = c("2010","2011","2012","2013","2014","2015","2016","2017","2018","2019"))
+# sample_data(ospprokR2)$Seq.Run <- factor(sample_data(ospprokR2)$Seq.Run, levels = c("1","2","3","4","5"))
+# 
+# sample_data(osp_prokH)$Depth <- factor(sample_data(osp_prokH)$Depth, levels = c("10","25","50","100","150","200","300"))
+# sample_data(osp_prokH)$Month_name <- factor(sample_data(osp_prokH)$Month_name, levels = c("February","June","August"))
+# sample_data(osp_prokH)$Year <- factor(sample_data(osp_prokH)$Year, levels = c("2010","2011","2012","2013","2014","2015","2016","2017","2018","2019"))
+# sample_data(osp_prokH)$Seq.Run <- factor(sample_data(osp_prokH)$Seq.Run, levels = c("1","2","3","4","5"))
+
+#color palettes for plotting
+MHWcols_full_BGCmatch<-c("#FCFBFD","#F3F1F7","#E7E5F1","#D5D6E9","#BFC0DE","indianred","#A9A6CF","#9390C3","#7E7AB8","darkred","#5E3997","#4E1C8A","#3F007D")
+
+
+depthblue<-c("#c7e9b4","#7fcdbb","#41b6c4","#1d91c0","#225ea8","#253494","#081d58")
+
+
+#### NMDS ####
+
+prok_depth_nmds<-plot_ordination(ospprokR, pnmds, type = "samples", color = "Depth", shape = "Month_name") + scale_color_manual(values = depthblue) + geom_point(size = 3) + 
+  # ggtitle("Prokaryotic community structure") + 
+  theme_bw() + labs(shape = "Month") + guides(color=guide_legend(ncol=2)) + theme_minimal()
+
+prok_depth_nmds
+
+# hellinger transformed data
+# plot_ordination(osp_prokH, pnmdsH, type = "samples", color = "Depth", shape = "Month_name") + scale_color_manual(values = depthblue) + geom_point(size = 3) + 
+#   # ggtitle("Prokaryotic community structure") + 
+#   theme_bw() + labs(shape = "Month") + guides(color=guide_legend(ncol=2)) + theme_minimal()
+
+#relative abundance
+prok_MHW_nmds<-plot_ordination(ospprokR, pnmds, type = "samples", color = "Year", shape = "Month_name") + scale_colour_manual(values = MHWcols_full_BGCmatch) + geom_point(size = 3) + 
+  # ggtitle("Prokaryotic community structure") + 
+  theme_bw() + labs(shape = "Month") + guides(color=guide_legend(ncol=2)) + theme_minimal()
+
+prok_MHW_nmds
+
+# plot_ordination(osp_prokH, pnmdsH, type = "samples", color = "Year", shape = "Month_name") + scale_colour_manual(values = MHWcols_full_BGCmatch) + geom_point(size = 3) +
+#   # ggtitle("Prokaryotic community structure") +
+#   theme_bw() + labs(shape = "Month") + guides(color=guide_legend(ncol=2)) + theme_minimal()
+
+
+prok_nmds_panel <- plot_grid(prok_depth_nmds,prok_MHW_nmds, ncol = 1, labels = c("C","D"), rel_heights = c(1,1), align = "hv")
+
+prok_nmds_panel
+
+# ggsave("prok_nmds_panel.jpg", prok_nmds_panel, width = 5, height = 6, units = "in")
+
+title_prok <- ggdraw() + 
+  draw_label(
+    "Prokaryotic ASVs",
+    fontface = 'bold',
+    x = 0,
+    hjust = 0
+  ) +
+  theme(
+    # add margin on the left of the drawing canvas,
+    # so title is aligned with left edge of first plot
+    plot.margin = margin(0, 0, 0, 7)
+  )
+
+prok_nmds_panel2 <- plot_grid(title_prok, prok_nmds_panel, ncol = 1, rel_heights = c(0.1,1))
+
+prok_nmds_panel2
+
+# nmds_panel_titles <- plot_grid(euk_nmds_panel2 , prok_nmds_panel2, ncol = 2, rel_heights = c(0.7,1.2), align = "hv")
+
+# ggsave("prok_euk_nmds_panel.jpg", nmds_panel_titles, width = 10, height = 8, units = "in")
+
+sample_data(osp_prok_fix_topf)$Depth <- factor(sample_data(osp_prok_fix_topf)$Depth, levels = c("10","25","50","100","150","200","300"))
+sample_data(osp_prok_fix_topf)$Year <- factor(sample_data(osp_prok_fix_topf)$Year, levels = c("2010","2011","2012","2013","2014","2015","2016","2017","2018","2019"))
+
+set.seed(9)
+
+# prok_all_MHW_pca<-osp_prok_fix_topf  %>%
+#   tax_transform(rank = "Genus", trans = "clr") %>%
+#  # dist_calc("aitchison") %>%
+#   ord_calc("PCA") %>%
+#   ord_plot(color = "Year", shape = "Month", size = 3, plot_taxa = 1:10, tax_lab_style = tax_lab_style(type = "text", size = 3, family = "Helvetica")) + guides(shape=FALSE) +
+#   scale_colour_manual(values = MHWcols_full_BGCmatch) 
+
+
+prok_all_MHW_pca_notaxa_leg<-osp_prok_fix_topf  %>%
+  tax_transform(rank = "Genus", trans = "clr") %>%
+ # dist_calc("aitchison") %>%
+  ord_calc("PCA") %>%
+  ord_plot(color = "Year", shape = "Month", size = 2) + guides(shape=FALSE) +
+  scale_colour_manual(values = MHWcols_full_BGCmatch) + theme(legend.position = "right")
+
+MHWcolor_leg <- get_legend(prok_all_MHW_pca_notaxa_leg)
+
+# Convert to a ggplot and print
+MHW_legend<-as_ggplot(MHWcolor_leg)
+
+prok_top10PC12_MHW_pca_notaxa<-osp_prok_fix_topf  %>%
+  tax_transform(rank = "Genus", trans = "clr") %>%
+ # dist_calc("aitchison") %>%
+  ord_calc("PCA") %>%
+  ord_plot(color = "Year", shape = "Month", size = 2) + guides(shape=FALSE, color = FALSE) +
+  scale_colour_manual(values = MHWcols_full_BGCmatch) 
+
+#who are the top genera for each axis
+solnP <- osp_prok_fix_topf %>%
+   tax_transform(rank = "Genus", trans = "clr") %>%
+  # dist_calc("aitchison") %>%
+   ord_calc("PCA") %>%
+   ord_get()
+
+solnP_table<-summary(solnP)$species 
+write.csv(solnP_table, "prok_pca_linep.csv")
+
+prok_PC1max<-data.frame(scores(solnP,
+     display=c("species"))) %>% arrange(desc(abs(PC1))) %>%
+     slice(1:10)
+
+prok_PC2max<-data.frame(scores(solnP,
+     display=c("species"))) %>% arrange(desc(abs(PC2))) %>%
+     slice(1:10)
+
+rownames(prok_PC1max)
+rownames(prok_PC2max)
+
+prok_top10PC12<-c("Nitrosopumilaceae","Candidatus_Nitrosopelagicus", "Formosa", "Candidatus_Nitrosopumilus","SAR116_clade","OCS116_clade",               
+"Nitrospina","Rhodobacteraceae Family","Planktomarina",     
+"HgCo23","Dadabacteriales","Magnetospira" ,"Alphaproteobacteria Class","MB11C04_marine_group","Ga0077536","Lentimonas","SS1-B-07-19","Pla3_lineage", "Nitrosomonas")     
+
+
+
+prok_top10PC12_z_pca_leg<-osp_prok_fix_topf  %>%
+  tax_transform(rank = "Genus", trans = "clr") %>%
+ # dist_calc("aitchison") %>%
+  ord_calc("PCA") %>%
+  ord_plot(color = "Depth", shape = "Month", size = 2, plot_taxa = prok_top10PC12, tax_lab_style = tax_lab_style(type = "text", size = 3)) +
+  # guides(shape=FALSE) +
+  scale_color_manual(values = depthblue) + theme(legend.position = "right")
+
+depthcol_leg <- get_legend(prok_top10PC12_z_pca_leg)
+
+# Convert to a ggplot and print
+depth_legend<-as_ggplot(depthcol_leg)
+
+prok_top10PC12_z_pca<-osp_prok_fix_topf  %>%
+  tax_transform(rank = "Genus", trans = "clr") %>%
+ # dist_calc("aitchison") %>%
+  ord_calc("PCA") %>%
+  ord_plot(color = "Depth", shape = "Month", size = 2, plot_taxa = prok_top10PC12, tax_lab_style = tax_lab_style(type = "text", size = 3)) +
+  guides(shape=FALSE, color = FALSE) +
+  scale_color_manual(values = depthblue)
+
+prok_top10PC12_z_pca
+
+      
+title_prok <- ggdraw() + 
+  draw_label(
+    "Prokaryotic genera",
+    fontface = 'bold',
+    x = 0,
+    size = 10,
+    hjust = 0
+  ) +
+  theme(
+    # add margin on the left of the drawing canvas,
+    # so title is aligned with left edge of first plot
+    plot.margin = margin(0, 0, 0, 7)
+  )
+
+#### make component of ordination figure for supplemental biomolecular ordination figure ####
+
+prok_pca_panel0 <- plot_grid(prok_top10PC12_z_pca, prok_top10PC12_MHW_pca_notaxa, labels = c("E","F"), label_size = 10)
+
+prok_pca_panel<-plot_grid(title_prok,prok_pca_panel0, ncol=1, rel_heights = c(0.1, 1))
+
+prok_pca_panel
+
+# ggsave("prok_pca_panel.jpg", prok_pca_panel, width = 10, height = 5, units = "in")
+
+```
+
+#### PERMANOVAs: Do prokaroytic communities differ by season or depth? 
+
+Use PERMANOVA to assess beta diversity differences among depths, season, depth ranges, heatwave years, etc. 
+
+```{R permanovas, warning = FALSE}
+
+metadf <- data.frame(sample_data(ospprokR))
+ospprokRS <- ospprokR %>% subset_samples(Season %in% c("Spring", "Summer"))
+prok_bray<-phyloseq::distance(ospprokRS, method = "bray")
+
+vegan::adonis2(prok_bray ~ phyloseq::sample_data(ospprokRS)$MHW.WC)
+vegan::adonis2(prok_bray ~ phyloseq::sample_data(ospprokRS)$WC)
+vegan::adonis2(prok_bray ~ phyloseq::sample_data(ospprokRS)$Season)
+vegan::adonis2(prok_bray ~ phyloseq::sample_data(ospprokRS)$Depth)
+pairwise.adonis(prok_bray, phyloseq::sample_data(ospprokRS)$MHW.WC, p.adjust.m = "BH")
+pairwise.adonis(prok_bray, phyloseq::sample_data(ospprokRS)$MHW.WC2)
+
+```
+
+#### Heat trees: Compare prokaryotic communities between the two heatwaves
+
+Use heat trees to visualize significant differences in prokaryotic communities between heatwave years, as determined using wilcoxon rank sum test. Used spring and summer data only, across both sites (P20 and P26) to represent the whole of the Northeast Subarctic Pacific (NESAP) Gyre.
+
+```{R prokaryotic heat tree, warning = FALSE} 
+osp_prokG <- osp_prok_fix_topf %>% tax_agg(rank = "Genus") #group at genus level
+
+#### P26 and P20, spring and summer only - MANUSCRIPT FIGURE COMPONENT ####
+
+proks_p20p26<-osp_prokG %>% 
+  subset_samples(Month != "2") %>%
+  # subset_samples(Station != "P20") %>%
+  phyloseq_filter_prevalence(
+  prev.trh = 0.02,
+  abund.trh = NULL,
+  threshold_condition = "OR",
+  abund.type = "total"
+) %>% phyloseq_filter_taxa_rel_abund(frac = 5e-04)
+
+pobj3<-parse_phyloseq(proks_p20p26)
+
+#obj3 - p20p26
+pobj3$data$otu_table_props <- calc_obs_props(pobj3, data = "otu_table", cols = pobj3$data$sample_data$sample_id) #Converting counts to proportions
+
+pobj3$data$tax_ab <- calc_taxon_abund(pobj3, "otu_table", cols = pobj3$data$sample_data$sample_id, groups = rep("total_count", nrow(pobj3$data$sample_data))) #Sum observation values for each taxon (and subtaxon; proteobacteria and also gammaproteobacteria, etc.)
+
+# Plot total count
+heat_tree(pobj3, node_label = taxon_names, node_size = total_count, node_color = total_count)
+
+#Calculating abundance per taxon
+pobj3$data$tax_prop <- calc_taxon_abund(pobj3, "otu_table_props", cols = pobj3$data$sample_data$sample_id) #now this calculates the proportions of each taxon (from domain to each unique genus) within each sample.  
+
+#For a given table in a taxmap object, split columns by a grouping factor and return row means in a table.
+pobj3$data$type_mean<- calc_group_mean(pobj3, "tax_prop",
+                                       cols = pobj3$data$sample_data$sample_id,
+                                       groups = pobj3$data$sample_data$MHW.WC)
+
+pobj3$data$type_mean_groups<- calc_group_mean(pobj3, "tax_prop",
+                                       cols = pobj3$data$sample_data$sample_id,
+                                       groups = pobj3$data$sample_data$MHW.groups)
+
+pobj3$data$type_mean_wc<- calc_group_mean(pobj3, "tax_prop",
+                                       cols = pobj3$data$sample_data$sample_id,
+                                       groups = pobj3$data$sample_data$WC)
+
+#For a given table in a taxmap object, split columns by a grouping factor and return row means in a table. in this case the grouping factor is just the whole dataset to get the dataset mean. this will be useful for scaling the nodes.
+
+pobj3$data$mean_all <- calc_group_mean(pobj3, "tax_prop",
+                                       cols = pobj3$data$sample_data$sample_id,
+                                       groups =  rep("mean", nrow(pobj3$data$sample_data)))
+
+#compare groups, statistically. Apply a function to compare data, usually abundance, from pairs of treatments/groups. By default, every pairwise combination of treatments are compared. 
+
+
+pobj3$data$diff_table <- pobj3 %>% 
+  # filter_taxa(taxon_ranks == "Level6", supertaxa = TRUE) %>%
+  compare_groups(pobj3, dataset = "tax_prop",
+                 cols = pobj3$data$sample_data$sample_id, # What columns of sample data to use
+                 groups = pobj3$data$sample_data$MHW.WC,
+                 combinations = list(c('MHW1-SML','MHW2-SML'),
+                                     c('MHW1-UMP', 'MHW2-UMP')))
+
+#now, adjust for multiple comparisons using Benjamini & Hochberg correction. anything that is not significant is turned to 0 so that not colors will be mapped to the heat tree.
+
+pobj3 <- mutate_obs(pobj3, "diff_table",
+                       wilcox_p_value = p.adjust(wilcox_p_value, method = "BH"),
+                       log2_median_ratio = ifelse(wilcox_p_value < 0.05 | is.na(wilcox_p_value), log2_median_ratio, 0))
+
+taxons_to_keep3<-filter(pobj3$data$diff_table, log2_median_ratio != 0)
+to_label3<-c(taxons_to_keep3$taxon_id) #only want to label the significantly different taxa.
+
+set.seed(1)
+heattree_prok3_sig_SMLnodes<-pobj3 %>%
+heat_tree_matrix(
+                 data = "diff_table",
+                 node_size = pobj3$data$type_mean_wc[['SML']], # n_obs is a function that calculates, in this case, the number of OTUs per taxon
+                 node_label = ifelse(taxon_ids %in% to_label3, taxon_names, ''),
+                 node_color = log2_median_ratio, # A column from `obj$data$diff_table`
+                 node_color_range = diverging_palette(),
+                 # node_color_range = c("#0F4392", "gray", "#FF4949"),
+                 node_color_trans = "area", # The default is scaled by circle area
+                 node_color_interval = c(-3, 3), # The range of `log2_median_ratio` to display
+                 edge_color_interval = c(-3, 3), # The range of `log2_median_ratio` to display
+                 # row_label_color = "#FF4949",
+                 # col_label_color = "#0F4392",
+                 node_size_trans = "area",
+                 node_size_range = c(0.005,0.04),
+                 node_label_size_range = c(0.01, 0.04),
+                 node_size_interval = c(0,1),
+                 # label_small_trees = TRUE,
+                 node_size_axis_label = "Average Relative Abundance",
+                 node_color_axis_label = "Log2 ratio median proportions",
+                 layout = "reingold-tilford", # The primary layout algorithm
+                 initial_layout = "reingold-tilford") 
+
+heattree_prok3_sig_SMLnodes
+
+set.seed(1)
+heattree_prok3_sig_UMPnodes<-pobj3 %>%
+heat_tree_matrix(
+                 data = "diff_table",
+                 node_size = pobj3$data$type_mean_wc[['UMP']], # n_obs is a function that calculates, in this case, the number of OTUs per taxon
+                 node_label = ifelse(taxon_ids %in% to_label3, taxon_names, ''),
+                 node_color = log2_median_ratio, # A column from `obj$data$diff_table`
+                 node_color_range = diverging_palette(),
+                 # node_color_range = c("#0F4392", "gray", "#FF4949"),
+                 node_color_trans = "area", # The default is scaled by circle area
+                 node_color_interval = c(-3, 3), # The range of `log2_median_ratio` to display
+                 edge_color_interval = c(-3, 3), # The range of `log2_median_ratio` to display
+                 # row_label_color = "#FF4949",
+                 # col_label_color = "#0F4392",
+                 node_size_trans = "area",
+                 node_size_range = c(0.005,0.04),
+                 node_label_size_range = c(0.01, 0.04),
+                 node_size_interval = c(0,1),
+                 # label_small_trees = TRUE,
+                 node_size_axis_label = "Average Relative Abundance",
+                 node_color_axis_label = "Log2 ratio median proportions",
+                 layout = "reingold-tilford", # The primary layout algorithm
+                 initial_layout = "reingold-tilford") 
+
+heattree_prok3_sig_UMPnodes
+
+# ggsave("heat-trees/heattree_prok_sig_SMLnodes-P20P26-springsummer-fixednodes.pdf", heattree_prok3_sig_SMLnodes, height = 8, width = 8, units = "in")
+# 
+# ggsave("heat-trees/heattree_prok_sig_UMPnodes-P20P26-springsummer-fixednodes.pdf", heattree_prok3_sig_UMPnodes, height = 8, width = 8, units = "in")
+
+#the above two files were then opened in adobe illustrator and the MHW1-UMP vs MHW2-UMP heattree with nodes sized to average relative abundance in the upper mesopelagic (from this file: heattree_prok_sig_UMPnodes-P20P26-springsummer-fixednodes.pdf) was combined with the MHW1-SML vs MHW2-SML heattree with nodes sized to average relative abundance in the surface mixed layer (from this file: heattree_prok_sig_SMLnodes-P20P26-springsummer-fixednodes.pdf) for the prokaryotic portion of this figure for the manuscript.
+
+
+```
+
+#### Prokaryotic heatmaps 
+Theese heatmaps are useful for general description of dominant taxa by season and within depth groups (SML, UMP)
+
+```{R prokaryotic heatmap, warning = FALSE}
+#recall color palettes
+#MHWcols_full_BGCmatch
+#depthblue
+
+sample_data(osp_prok_fix_topf)$Depth <- factor(sample_data(osp_prok_fix_topf)$Depth, levels = c("10","25","50","100","150","200","300"))
+sample_data(osp_prok_fix_topf)$Month <- factor(sample_data(osp_prok_fix_topf)$Month, levels = c("2","6","8"))
+sample_data(osp_prok_fix_topf)$Year <- factor(sample_data(osp_prok_fix_topf)$Year, levels = c("2010","2011","2012","2013","2014","2015","2016","2017","2018","2019"))
+
+sample_data(osp_prok_fix_topf)$Station<-factor(sample_data(osp_prok_fix_topf)$Station, levels = c("P20","P26")) 
+
+# have toggled back and forth between using compositional or hellinger transformation. hellinger makes the differences a bit more visible in lower abundance taxa but ultimately, relative abundance is a bit easier to grasp conceptually. 
+
+#### Phylum heatmap, hellinger transformed ####
+prok_phy_htmp<-osp_prok_fix_topf %>%
+  ps_seriate(rank = "Phylum", tax_transform = "hellinger", dist = "bray") %>%
+  tax_transform("hellinger", rank = "Phylum") %>%
+  comp_heatmap(
+    taxa = tax_top(osp_prok_fix_topf, 15, by = sum, rank = "Phylum"),
+    sample_anno = sampleAnnotation(
+      "Depth" = anno_sample_cat(var = "Depth", col = c("10" = "#c7e9b4","25" = "#7fcdbb","50"="#41b6c4","100" = "#1d91c0","150" ="#225ea8", "200"= "#253494","300" = "#081d58"), legend_title = "Depth", size = grid::unit(2, "mm")),
+      "Station" = anno_sample_cat(var = "Station", legend_title = "Station",size = grid::unit(2, "mm")),
+      "Month" = anno_sample_cat(var = "Month_name", col = c("February" = "#124076", "June" = "#7F9F80", "August" = "#F9E897"), legend_title = "Month", size = grid::unit(2, "mm")),
+      "Year" = anno_sample_cat(var = "Year", col = c("2010" = "#FCFBFD","2011"="#F3F1F7","2012" = "#E7E5F1","2013"="#D5D6E9","2014"="#BFC0DE","2015" = "indianred", "2016" = "#A9A6CF", "2017" = "#9390C3","2018" ="#7E7AB8","2019"="darkred"), legend_title = "Year", size = grid::unit(2, "mm"))),
+    sample_seriation = "Identity" # suppress sample reordering
+  )
+
+prok_phy_htmp %>% ComplexHeatmap::draw(
+  annotation_legend_list = attr(prok_phy_htmp, "AnnoLegends")
+)
+
+# pdf("heatmaps/prok_phy_htmp.pdf",height = 4, width = 9)
+# prok_phy_htmp %>% ComplexHeatmap::draw(
+#   annotation_legend_list = attr(prok_phy_htmp, "AnnoLegends")
+# )
+# dev.off()
+#
+# comp_barplot(osp_prok_fix_topf, tax_level = "Class", n_taxa = 15) #quick look at barplot shows that 'other' represents a small fraction of the data when plotting @ class, and top 15 clases
+
+#### Class heatmap, relative abundance ####
+
+#relative abundance
+prok_cls_htmp_RA <-osp_prok_fix_topf %>%
+  ps_seriate(rank = "Class", tax_transform = "compositional", dist = "bray") %>%
+  tax_transform("compositional", rank = "Class") %>%
+  comp_heatmap(
+    taxa = tax_top(osp_prok_fix_topf, 15, by = sum, rank = "Class"),
+    sample_anno = sampleAnnotation(
+     "Depth" = anno_sample_cat(var = "Depth", col = c("10" = "#c7e9b4","25" = "#7fcdbb","50"="#41b6c4","100" = "#1d91c0","150" ="#225ea8" ,"200"= "#253494","300" = "#081d58"), legend_title = "Depth",size = grid::unit(2, "mm")),
+      "Station" = anno_sample_cat(var = "Station", legend_title = "Station",size = grid::unit(2, "mm")),
+      "Month" = anno_sample_cat(var = "Month", col = c("2" = "#124076", "6" = "#7F9F80", "8" = "#F9E897"), legend_title = "Month",size = grid::unit(2, "mm")),
+     "Year" = anno_sample_cat(var = "Year", col = c("2010" = "#FCFBFD","2011"="#F3F1F7","2012" = "#E7E5F1","2013"="#D5D6E9","2014"="#BFC0DE","2015" = "indianred", "2016" = "#A9A6CF", "2017" = "#9390C3","2018" ="#7E7AB8","2019"= "darkred"), legend_title = "Year",size = grid::unit(2, "mm"))
+    ),
+    sample_seriation = "Identity" # suppress sample reordering
+  )
+
+prok_cls_htmp_RA %>% ComplexHeatmap::draw(
+  annotation_legend_list = attr(prok_cls_htmp_RA, "AnnoLegends")
+)
+
+# pdf("heatmaps/prok_cls_htmp_RA.pdf",height = 4, width = 9)
+# prok_cls_htmp_RA %>% ComplexHeatmap::draw(
+#   annotation_legend_list = attr(prok_cls_htmp_RA, "AnnoLegends")
+# )
+# dev.off()
+
+#### Class heatmap, hellinger transformed ####
+
+#or hellinger transformed
+prok_cls_htmp_hel <-osp_prok_fix_topf %>%
+  ps_arrange(WC,Depth,MHW.groups,Season) %>%
+  # ps_seriate(rank = "Class", tax_transform = "hellinger", dist = "bray") %>%
+  tax_transform("hellinger", rank = "Class") %>%
+  comp_heatmap(
+    taxa = tax_top(osp_prok_fix_topf, 20, by = sum, rank = "Class"),
+    sample_anno = sampleAnnotation(
+     "Depth" = anno_sample_cat(var = "Depth", col = c("10" = "#c7e9b4","25" = "#7fcdbb","50"="#41b6c4","100" = "#1d91c0","150" ="#225ea8" ,"200"= "#253494","300" = "#081d58"), legend_title = "Depth",size = grid::unit(2, "mm")),
+      "Station" = anno_sample_cat(var = "Station", legend_title = "Station",size = grid::unit(2, "mm")),
+      "Month" = anno_sample_cat(var = "Month", col = c("2" = "#124076", "6" = "#7F9F80", "8" = "#F9E897"), legend_title = "Month",size = grid::unit(2, "mm")),
+     "Year" = anno_sample_cat(var = "Year", col = c("2010" = "#FCFBFD","2011"="#F3F1F7","2012" = "#E7E5F1","2013"="#D5D6E9","2014"="#BFC0DE","2015" = "indianred", "2016" = "#A9A6CF", "2017" = "#9390C3","2018" ="#7E7AB8","2019"= "darkred"), legend_title = "Year",size = grid::unit(2, "mm"))
+    ),
+    sample_seriation = "Identity" # suppress sample reordering
+  )
+
+prok_cls_htmp_hel %>% ComplexHeatmap::draw(
+  annotation_legend_list = attr(prok_cls_htmp_hel, "AnnoLegends")
+)
+
+#### Family heatmap ####
+
+prok_fam_htmp <-osp_prok_fix_topf %>%
+  # ps_arrange(WC,Month, MHW.groups) %>%
+  # subset_samples(Season != "Winter") %>%
+  ps_seriate(rank = "Family", tax_transform = "compositional", dist = "bray") %>%
+  tax_transform("compositional", rank = "Family") %>%
+  comp_heatmap(
+    taxa = tax_top(osp_prok_fix_topf, 20, by = sum, rank = "Family", use_counts = FALSE),
+    sample_anno = sampleAnnotation(
+     "Depth" = anno_sample_cat(var = "Depth", col = c("10" = "#c7e9b4","25" = "#7fcdbb","50"="#41b6c4","100" = "#1d91c0","150" ="#225ea8" ,"200"= "#253494","300" = "#081d58"), legend_title = "Depth",size = grid::unit(2, "mm")),
+      "Station" = anno_sample_cat(var = "Station", legend_title = "Station",size = grid::unit(2, "mm")),
+      "Month" = anno_sample_cat(var = "Month", col = c("2" = "#124076", "6" = "#7F9F80", "8" = "#F9E897"), legend_title = "Month",size = grid::unit(2, "mm")),
+     "Year" = anno_sample_cat(var = "Year", col = c("2010" = "#FCFBFD","2011"="#F3F1F7","2012" = "#E7E5F1","2013"="#D5D6E9","2014"="#BFC0DE","2015" = "indianred", "2016" = "#A9A6CF", "2017" = "#9390C3","2018" ="#7E7AB8","2019"= "darkred"), legend_title = "Year",size = grid::unit(2, "mm"))
+    ),
+    sample_seriation = "Identity"
+)
+
+prok_fam_htmp %>% ComplexHeatmap::draw(
+  annotation_legend_list = attr(prok_fam_htmp, "AnnoLegends")
+)
+
+#### Order heatmap ####
+
+prok_ord_htmp <-osp_prok_fix_topf %>%
+  ps_seriate(rank = "Order", tax_transform = "compositional", dist = "bray") %>%
+  tax_transform("compositional", rank = "Order") %>%
+  comp_heatmap(
+    taxa = tax_top(osp_prok_fix_topf, 15, by = sum, rank = "Order"),
+    sample_anno = sampleAnnotation(
+     "Depth" = anno_sample_cat(var = "Depth", col = c("10" = "#c7e9b4","25" = "#7fcdbb","50"="#41b6c4","100" = "#1d91c0","150" ="#225ea8" ,"200"= "#253494","300" = "#081d58"), legend_title = "Depth",size = grid::unit(2, "mm")),
+      "Station" = anno_sample_cat(var = "Station", legend_title = "Station",size = grid::unit(2, "mm")),
+      "Month" = anno_sample_cat(var = "Month", col = c("2" = "#124076", "6" = "#7F9F80", "8" = "#F9E897"), legend_title = "Month",size = grid::unit(2, "mm")),
+     "Year" = anno_sample_cat(var = "Year", col = c("2010" = "#FCFBFD","2011"="#F3F1F7","2012" = "#E7E5F1","2013"="#D5D6E9","2014"="#BFC0DE","2015" = "indianred", "2016" = "#A9A6CF", "2017" = "#9390C3","2018" ="#7E7AB8","2019"= "darkred"), legend_title = "Year",size = grid::unit(2, "mm"))
+    ),
+    sample_seriation = "Identity" # suppress sample reordering
+  )
+
+prok_ord_htmp %>% ComplexHeatmap::draw(
+  annotation_legend_list = attr(prok_ord_htmp, "AnnoLegends")
+)
+
+# pdf("heatmaps/prok_ord_htmp.pdf",height = 4, width = 9)
+# prok_ord_htmp %>% ComplexHeatmap::draw(
+#   annotation_legend_list = attr(prok_ord_htmp, "AnnoLegends")
+# )
+# dev.off()
+
+#have to save manually for some reason.
+
+#### Genus heatmap ####
+
+prok_gen_htmp <-osp_prok_fix_topf %>%
+  ps_seriate(rank = "Genus", tax_transform = "compositional", dist = "bray") %>%
+  tax_transform("compositional", rank = "Genus") %>%
+  comp_heatmap(
+    taxa = tax_top(osp_prok_fix_topf, 30, by = sum, rank = "Genus"),
+    sample_anno = sampleAnnotation(
+     "Depth" = anno_sample_cat(var = "Depth", col = c("10" = "#c7e9b4","25" = "#7fcdbb","50"="#41b6c4","100" = "#1d91c0","150" ="#225ea8" ,"200"= "#253494","300" = "#081d58"), legend_title = "Depth",size = grid::unit(2, "mm")),
+      "Station" = anno_sample_cat(var = "Station", legend_title = "Station",size = grid::unit(2, "mm")),
+      "Month" = anno_sample_cat(var = "Month", col = c("2" = "#124076", "6" = "#7F9F80", "8" = "#F9E897"), legend_title = "Month",size = grid::unit(2, "mm")),
+      "Year" = anno_sample_cat(var = "Year", col = c("2010" = "#FCFBFD","2011"="#F3F1F7","2012" = "#E7E5F1","2013"="#D5D6E9","2014"="#BFC0DE","2015" = "indianred", "2016" = "#A9A6CF", "2017" = "#9390C3","2018" ="#7E7AB8","2019"= "darkred"), legend_title = "Year",size = grid::unit(2, "mm"))
+    ),
+    sample_seriation = "Identity" # suppress sample reordering
+  )
+
+
+ComplexHeatmap::draw(object = prok_gen_htmp,
+  annotation_legend_list = attr(prok_gen_htmp, "AnnoLegends"))
+
+# pdf("heatmaps/prok_gen_htmp.pdf",height = 4, width = 9)
+# ComplexHeatmap::draw(object = prok_gen_htmp,
+#   annotation_legend_list = attr(prok_gen_htmp, "AnnoLegends")
+# )
+# dev.off()
+
+#The Class and Genus heatmaps were combined (in illustrator) for a heatmap panel, to be used in supplemental material
+
+```
+
+### 18S V4 rRNA gene amplicon sequencing (metabarcoding) data
+
+#### Load 18S data, make phyloseq object, and clean it up
+
+```{R load eukaryotic data, warning = FALSE}
+
+easvfile <-as.matrix(read.csv("osp-18S-asvtable.csv", row.names=1, header = TRUE)) #asv table exported from qiime2; note : if you reading the file as a table / .tsv file the early calvert samples (which have numeric IDs, are lost when creating phyloseq object. when you read in the file as a CSV, R puts an X in front of these and thus they are read into phyloseq just fine).
+etaxfileH <-as.matrix(read.csv("osp-18S-pr2mgz-taxonomy-v2-hplc.csv",row.names=1,header = TRUE))
+etaxfile <-as.matrix(read.csv("osp-18S-pr2mgz-taxonomy-v2.csv",row.names=1,header = TRUE))# 
+#taxfile_pr2 <-as.matrix(read.csv("osp-merged/osp_jgi_silvatax.csv",row.names=1,header = TRUE))
+#taxonomy file 
+emapfile <-read.csv("osp-18S-metadata-R.csv",row.names = 1, header=TRUE)
+
+emapfile$Date <- as.Date(emapfile$Date)
+
+
+#make phyloseq object
+
+check <- match(rownames(emapfile), colnames(easvfile))
+
+
+eOTU = otu_table(easvfile, taxa_are_rows = TRUE)
+eTAX = tax_table(etaxfile)
+eMAP = sample_data(emapfile)
+#TRE = phy_tree(treefile)
+
+#physeq_hmic = merge_phyloseq(OTU, TAX, MAP,TRE) #This is the phyloseq object for the prokaryotic data
+osp_euks_all = merge_phyloseq(eOTU, eTAX, eMAP)
+
+#create surface dataset (although this is pretty much all we sequenced for 18S)
+osp_euks <- osp_euks_all %>% subset_samples(Depth == 10 | Depth == 25 | Depth == 50 | Depth == 100 | Depth == 150 | Depth == 200 | Depth == 300)
+
+
+osp_euks_sum_table <- data.table(as(sample_data(osp_euks), "data.frame"),
+                 TotalReads = sample_sums(osp_euks), keep.rownames = TRUE)
+
+min(osp_euks_sum_table$TotalReads) #24
+mean(osp_euks_sum_table$TotalReads) #56518
+median(osp_euks_sum_table$TotalReads) #55928
+
+ggplot(osp_euks_sum_table, aes(x=TotalReads)) + geom_histogram(color = "purple", fill = "white", bins = 100) + labs(x="Total Reads", y= "Count", title="Distribution of Read Depth of OSP Eukaryotic eDNA")
+
+
+#remove samples with low read counts
+osp_euks_pruned<-prune_samples(sample_sums(osp_euks) > 10000, osp_euks) 
+
+osp_euks_pruned<-prune_samples(sample_sums(osp_euks_pruned) < 100000, osp_euks_pruned) #remove samples that had anomalously high read counts
+
+osp_euks_pruned<-prune_taxa(taxa_sums(osp_euks_pruned) > 2, osp_euks_pruned) #remove ASVs that are not present in at least 2 samples
+
+#cleanup taxonomic table, using microViz tax_fix function
+osp_euks_fix1 <- osp_euks_pruned %>%
+ tax_fix(
+  min_length = 4,
+  unknowns = c("", "NA","unknown","uncultured","Incertae_Sedis"),
+  sep = " ", anon_unique = TRUE,
+  suffix_rank = "classified"
+ )
+
+osp_euks_fix<-osp_euks_fix1 %>% tax_select(tax_list = "Eukaryote Domain", deselect = TRUE) #remove ASVs that are not annotated beyond domain
+
+osp_euks_fix<-osp_euks_fix %>% tax_select(tax_list = "Unassigned Domain", deselect = TRUE) #remove ASVs that are not annotated beyond domain
+
+
+```
+
+#### Beta diversity: Eukaryotes
+
+```{R eukaryotic ordinations, warning = FALSE, results = FALSE}
+
+#there are a few ways we can do this
+#proportion
+ospeuksR = transform_sample_counts(osp_euks_fix, function(x) x / sum(x) )
+# ospeuks.hel = tax_transform(osp_euks_fix, trans = "hellinger")
+
+
+enmds<-ordinate(ospeuksR , method = "NMDS",distance = "bray",k = 3, trymax = 500 )
+sample_data(ospeuksR)$Depth <- factor(sample_data(ospeuksR)$Depth, levels = c("10","25","50","100","150","200","300"))
+sample_data(ospeuksR)$MonthName <- factor(sample_data(ospeuksR)$MonthName, levels = c("February","June","August"))
+sample_data(ospeuksR)$Year <- factor(sample_data(ospeuksR)$Year, levels = c("2015","2016","2017","2018","2019"))
+
+
+enmds<-ordinate(ospeuksR , method = "NMDS",distance = "bray",k = 3, trymax = 500 )
+epcoa<-ordinate(ospeuksR , method = "PCoA",distance = "bray")
+sample_data(osp_euks_fix)$Depth <- factor(sample_data(osp_euks_fix)$Depth, levels = c("10","25","50","100","150","200","300"))
+sample_data(osp_euks_fix)$MonthName <- factor(sample_data(osp_euks_fix)$MonthName, levels = c("February","June","August"))
+sample_data(osp_euks_fix)$Year <- factor(sample_data(osp_euks_fix)$Year, levels = c("2015","2016","2017","2018","2019"))
+
+
+MHWcols_purple5<-c("indianred","#A9A6CF","#9390C3","#7E7AB8","darkred")
+
+euk_depth_ord<-plot_ordination(ospeuksR, enmds, type = "samples", color = "Depth", shape = "MonthName") + scale_colour_manual(values = depthblue) + geom_point(size = 4) + 
+#  ggtitle("Eukaryotic community structure (18S-V4)") + 
+ labs(shape = "Month") + theme_minimal() + theme(legend.position = "none")
+
+euk_year_ord<-plot_ordination(ospeuksR, enmds, type = "samples", color = "Year", shape = "MonthName") + scale_colour_manual(values = MHWcols_purple5) + geom_point(size = 4) + 
+ # ggtitle("Eukaryotic community structure (18S-V4)") + 
+  theme_bw() + labs(shape = "Month") + theme_minimal() + theme(legend.position = "none")
+
+euk_depth_pcoa<-plot_ordination(ospeuksR, epcoa, type = "samples", color = "Depth", shape = "MonthName") + scale_colour_manual(values = depthblue) + geom_point(size = 4) + ggtitle("Eukaryotic community structure (18S-V4)") + theme_bw() + labs(shape = "Month") + theme_minimal()
+
+euk_year_pcoa<-plot_ordination(ospeuksR, epcoa, type = "samples", color = "Year", shape = "MonthName") + scale_colour_manual(values = MHWcols_purple5) + geom_point(size = 4) + ggtitle("Eukaryotic community structure (18S-V4)") + theme_bw() + labs(shape = "Month") + theme_minimal()
+
+euk_nmds_panel <- plot_grid(euk_depth_ord, euk_year_ord, ncol = 1, labels = c("A","B"))
+euk_nmds_panel
+
+
+title_euk <- ggdraw() + 
+  draw_label(
+    "Eukarytotic ASVs",
+    fontface = 'bold',
+    x = 0,
+    hjust = 0
+  ) +
+  theme(
+    # add margin on the left of the drawing canvas,
+    # so title is aligned with left edge of first plot
+    plot.margin = margin(0, 0, 0, 7)
+  )
+
+euk_nmds_panel2 <- plot_grid(title_euk, euk_nmds_panel, ncol = 1, rel_heights = c(0.1,1))
+
+euk_nmds_panel2
+
+# ggsave("euk_nmds_panel.jpg", euk_nmds_panel, width = 4, height = 6, units = "in")
+
+
+#### all eukaryotes ####
+#who are the top genera for each axis
+solnPCA_euks<- osp_euks_fix %>%
+   tax_transform(rank = "Genus", trans = "clr") %>%
+  # dist_calc("aitchison") %>%
+   ord_calc("PCA") %>%
+   ord_get()
+
+solnPCA_euks_table<-summary(solnPCA_euks)$species 
+write.csv(solnPCA_euks_table, "euks_pca_linep.csv")
+
+euk_nonani_PC1max<-data.frame(scores(solnPCA_euks,
+     display=c("species"))) %>% arrange(desc(abs(PC1))) %>%
+     slice(1:10)
+
+euk_nonani_PC2max<-data.frame(scores(solnPCA_euks,
+     display=c("species"))) %>% arrange(desc(abs(PC2))) %>%
+     slice(1:10)
+
+rownames(euk_nonani_PC1max)
+rownames(euk_nonani_PC2max)
+
+euk_top10PC12<-c("Cladococcus","Phaeocystis","RAD-B_X_Group-IV_XX","Dino-Group-I-Clade-2_X", "Heliosphaera","Cyclopoida Order","RAD-B_X_Group-II_X", "Strombidiidae_X", "Chytriodinium", "Pseudochattonella", "Micromonas", "Bathycoccus", "Paracalanus", "Prymnesiophyceae_Clade_B3_X", "Metridia", "MAST-1A",  "Ergasilida Family", "Dioithona", "Haramonas", "RAD-C_Xb_X")
+
+set.seed(9)
+
+euk_all_MHW_pca<-osp_euks_fix  %>%
+  tax_transform(rank = "Genus", trans = "clr") %>%
+ # dist_calc("aitchison") %>%
+  ord_calc("PCA") %>%
+  ord_plot(color = "Year", shape = "Month", size = 2) +
+  scale_colour_manual(values = MHWcols_purple5) + guides(shape=FALSE, color = FALSE)
+
+euk_all_MHW_pca
+
+euk_opi_z_pca<-osp_euks_fix  %>%
+  tax_transform(rank = "Genus", trans = "clr") %>%
+ # dist_calc("aitchison") %>%
+  ord_calc("PCA") %>%
+  ord_plot(color = "Depth", shape = "Month", size = 2, plot_taxa = 1:20, tax_lab_style = tax_lab_style(type = "text", size = 3)) +
+  scale_colour_manual(values = depthblue)
+
+euk_opi_z_pca
+
+euk_all_z_pca<-osp_euks_fix  %>%
+  tax_transform(rank = "Genus", trans = "clr") %>%
+ # dist_calc("aitchison") %>%
+  ord_calc("PCA") %>%
+  ord_plot(color = "Depth", shape = "Month", size = 3, plot_taxa = 1:15, tax_lab_style = tax_lab_style(type = "text", size = 3)) +
+  scale_colour_manual(values = depthblue)
+
+euk_all_z_pca
+
+#### animals ####
+#who are the top genera for each axis
+solnPCA_opi<- osp_euks_fix %>%
+  subset_taxa(Supergroup == "Opisthokonta") %>%
+   tax_transform(rank = "Genus", trans = "clr") %>%
+  # dist_calc("aitchison") %>%
+   ord_calc("PCA") %>%
+   ord_get()
+
+solnPCA_opi_table<-summary(solnPCA_opi)$species 
+write.csv(solnPCA_opi_table, "opi_pca_linep.csv")
+
+euk_opi_PC1max<-data.frame(scores(solnPCA_opi,
+     display=c("species"))) %>% arrange(desc(abs(PC1))) %>%
+     slice(1:10)
+
+euk_opi_PC2max<-data.frame(scores(solnPCA_opi,
+     display=c("species"))) %>% arrange(desc(abs(PC2))) %>%
+     slice(1:10)
+
+rownames(euk_opi_PC1max)
+rownames(euk_opi_PC2max)
+
+opi_top10PC12<-c("Cyclopoida Order","Oithona","Chondracanthidae","Siphonophorae Class", "Physonectae Infraclass", "Microcalanus", "Calliacantha_natans","Dioithona", "Stephanoecidae_Group_D_X_sp.", "Paracalanus", "Metridia", "Oithonidae Family", "Ergasilida Family", "Calanus","Chondracanthidae","Neocopepoda Infraclass","Stephanoecidae_Group_H Order", "Neocalanus")
+
+
+set.seed(9)
+euk_ani_z_pca<-osp_euks_fix  %>%
+  subset_taxa(Supergroup == "Opisthokonta") %>%
+  tax_transform(rank = "Genus", trans = "clr") %>%
+ # dist_calc("aitchison") %>%
+  ord_calc("PCA") %>%
+  ord_plot(color = "Depth", shape = "Month", size = 2, plot_taxa = opi_top10PC12, tax_lab_style = tax_lab_style(type = "text", size = 3)) +
+  scale_color_manual(values = depthblue) +
+  guides(shape = FALSE, color = FALSE)
+
+euk_ani_z_pca
+
+osp_euks_fix  %>%
+  subset_taxa(Supergroup == "Opisthokonta") %>%
+  tax_transform(rank = "Family", trans = "clr") %>%
+ # dist_calc("aitchison") %>%
+  ord_calc("PCA") %>%
+  ord_plot(color = "Depth", shape = "Month", size = 2, plot_taxa = c(1:5,10:15), tax_lab_style = tax_lab_style(type = "text", size = 3)) +
+  scale_color_manual(values = depthblue) +
+  guides(shape = FALSE, color = FALSE)
+
+set.seed(9)
+euk_ani_year_pca<-osp_euks_fix  %>%
+  subset_taxa(Supergroup == "Opisthokonta") %>%
+  tax_transform(rank = "Genus", trans = "clr") %>%
+ # dist_calc("aitchison") %>%
+  ord_calc("PCA") %>%
+  ord_plot(color = "Year", shape = "Month", size = 2) + 
+  scale_colour_manual(values = MHWcols_purple5) + guides(shape = FALSE, color = FALSE)
+
+#### non animals ####
+#who are the top genera for each axis
+solnPCA_nonopi<- osp_euks_fix %>%
+  subset_taxa(Supergroup != "Opisthokonta") %>%
+   tax_transform(rank = "Genus", trans = "clr") %>%
+  # dist_calc("aitchison") %>%
+   ord_calc("PCA") %>%
+   ord_get()
+
+solnPCA_nonopi_table<-summary(solnPCA_nonopi)$species 
+write.csv(solnPCA_nonopi_table, "nonopi_pca_linep.csv")
+
+euk_nonopi_PC1max<-data.frame(scores(solnPCA_nonopi,
+     display=c("species"))) %>% arrange(desc(abs(PC1))) %>%
+     slice(1:10)
+
+euk_nonopi_PC2max<-data.frame(scores(solnPCA_nonopi,
+     display=c("species"))) %>% arrange(desc(abs(PC2))) %>%
+     slice(1:10)
+
+rownames(euk_nonopi_PC1max)
+rownames(euk_nonopi_PC2max)
+
+nonopi_top10PC12<-c("Cladococcus","Phaeocystis","RAD-B_X_Group-IV_XX","Dino-Group-I-Clade-2_X","Heliosphaera", "RAD-B_X_Group-II_X","Strombidiidae_X","Chytriodinium", "Pseudochattonella","Bathycoccus","Micromonas","Prymnesiophyceae_Clade_B3_X","MAST-1A", "Chaetoceros", "Haramonas","RAD-C_Xb_X","MAST-7A", "Azadinium", "Pelagomonas")    
+
+set.seed(9)
+euk_notani_z_pca<-osp_euks_fix  %>%
+  subset_taxa(Supergroup != "Opisthokonta") %>%
+  tax_transform(rank = "Genus", trans = "clr") %>%
+ # dist_calc("aitchison") %>%
+  ord_calc("PCA") %>%
+  ord_plot(color = "Depth", shape = "Month", size = 2, plot_taxa = nonopi_top10PC12, tax_lab_style = tax_lab_style(type = "text", size = 3)) + scale_colour_manual(values = depthblue) + guides(shape = FALSE, color = FALSE)
+
+set.seed(9)
+euk_notani_year_pca<-osp_euks_fix  %>%
+  subset_taxa(Supergroup != "Opisthokonta") %>%
+  tax_transform(rank = "Genus", trans = "clr") %>%
+ # dist_calc("aitchison") %>%
+  ord_calc("PCA") %>%
+  ord_plot(color = "Year", shape = "Month", size = 2) + scale_colour_manual(values = MHWcols_purple5) +
+  guides(shape = FALSE, color = FALSE)
+
+title_opis <- ggdraw() + 
+  draw_label(
+    "Opisthokonta genera",
+    fontface = 'bold',
+    x = 0,
+    size = 10,
+    hjust = 0
+  ) +
+  theme(
+    # add margin on the left of the drawing canvas,
+    # so title is aligned with left edge of first plot
+    plot.margin = margin(0, 0, 0, 7)
+  )
+
+
+title_nonopis <- ggdraw() + 
+  draw_label(
+    "Non-Opisthokonta genera",
+    fontface = 'bold',
+    size = 10,
+    x = 0,
+    hjust = 0
+  ) +
+  theme(
+    # add margin on the left of the drawing canvas,
+    # so title is aligned with left edge of first plot
+    plot.margin = margin(0, 0, 0, 7)
+  )
+
+euk_pca_panel_opis0 <- plot_grid(euk_ani_z_pca, euk_ani_year_pca, labels = c("A","B"), label_size = 10)
+euk_pca_panel_opis<-plot_grid(title_opis,euk_pca_panel_opis0, ncol=1, rel_heights = c(0.1, 1))
+
+euk_pca_panel_notopis0 <- plot_grid(euk_notani_z_pca, euk_notani_year_pca, labels = c("C","D"), label_size = 10)
+euk_pca_panel_nonopis<-plot_grid(title_nonopis,euk_pca_panel_notopis0, ncol=1, rel_heights = c(0.1, 1))
+                                
+euk_pca_panel <- plot_grid(euk_pca_panel_opis,euk_pca_panel_nonopis, ncol = 1)
+
+euk_pca_panel
+
+# ggsave("euk_pca_panel.jpg", euk_pca_panel, width = 8, height = 8, units = "in")
+
+
+enmds_species<-ordinate(tax_glom(ospeuksR, taxrank = "Species"), method = "NMDS",distance = "bray", k = 3, trymax = 500)
+
+ospeuks_sp<-tax_glom(ospeuksR, taxrank = "Species")
+sample_data(ospeuks_sp)$Year <- factor(sample_data(ospeuks_sp)$Year, levels = c("2015","2016","2017","2018","2019"))
+
+plot_ordination(ospeuks_sp, enmds_species, type = "samples", color = "Year", shape = "MonthName") + geom_point(size = 4) + ggtitle("Eukaryotic community structure (18S-V4)") + theme_bw() + labs(shape = "Month") + scale_colour_manual(values = MHWcols_purple5)
+
+```
+
+#### Eukaryote + Prokaryote Ordination Panel
+
+```{R all domains ordination panel for supplemental material, fig.height = 10, fig.width = 6}
+
+euks_proks_pcas0<-plot_grid(euk_pca_panel_opis, euk_pca_panel_nonopis, prok_pca_panel, ncol = 1)
+
+legends<-plot_grid(depth_legend, MHW_legend, ncol = 1, rel_heights = c(1,0.9))
+
+euks_proks_pcas<-plot_grid(euks_proks_pcas0, legends, ncol =2, rel_widths = c(1, 0.15))
+
+euks_proks_pcas
+
+# ggsave("euks_proks_pcas.jpg", euks_proks_pcas, width = 9, height = 12, units = "in")
+# ggsave("euks_proks_pcas.pdf", euks_proks_pcas, width = 9, height = 12, units = "in")
+
+```
+
+#### PERMANOVAs: Do eukaryotic communities differ by season or depth?
+
+```{R eukaryotic permanovas, warning = FALSE}
+
+#### permanova ####
+
+ospeuksRS <- ospeuksR %>% subset_samples(Season %in% c("Spring", "Summer"))
+euk_bray<-phyloseq::distance(ospeuksRS, method = "bray")
+
+vegan::adonis2(euk_bray ~ phyloseq::sample_data(ospeuksRS)$MHW_WC)
+vegan::adonis2(euk_bray ~ phyloseq::sample_data(ospeuksRS)$WC)
+vegan::adonis2(euk_bray ~ phyloseq::sample_data(ospeuksRS)$Season)
+vegan::adonis2(euk_bray ~ phyloseq::sample_data(ospeuksRS)$Depth)
+pairwise.adonis(euk_bray, phyloseq::sample_data(ospeuksRS)$MHW_WC, p.adjust.m = "BH")
+
+animals
+ani<-osp_euks_fix %>% subset_taxa(Supergroup == "Opisthokonta")
+aniS <- ani %>% subset_samples(Season %in% c("Spring", "Summer"))
+aniR = transform_sample_counts(aniS, function(x) x / sum(x) )
+ani_bray<-phyloseq::distance(aniR, method = "bray")
+
+vegan::adonis2(ani_bray ~ phyloseq::sample_data(aniR)$MHW_WC)
+vegan::adonis2(ani_bray ~ phyloseq::sample_data(aniR)$WC)
+vegan::adonis2(ani_bray ~ phyloseq::sample_data(aniR)$Depth)
+vegan::adonis2(ani_bray ~ phyloseq::sample_data(aniR)$Season)
+pairwise.adonis(ani_bray, phyloseq::sample_data(aniR)$MHW_WC, p.adjust.m = "BH")
+
+
+
+#non-animals
+nonani<-osp_euks_fix %>% subset_taxa(Supergroup != "Opisthokonta")
+nonaniS <- nonani %>% subset_samples(Season %in% c("Spring", "Summer"))
+nonaniR = transform_sample_counts(nonaniS, function(x) x / sum(x) )
+nonani_bray<-phyloseq::distance(nonaniR, method = "bray")
+
+vegan::adonis2(nonani_bray ~ phyloseq::sample_data(nonaniR)$MHW_WC)
+vegan::adonis2(nonani_bray ~ phyloseq::sample_data(nonaniR)$WC)
+vegan::adonis2(nonani_bray ~ phyloseq::sample_data(nonaniR)$Depth)
+vegan::adonis2(nonani_bray ~ phyloseq::sample_data(nonaniR)$Season)
+pairwise.adonis(nonani_bray, phyloseq::sample_data(nonaniR)$MHW_WC, p.adjust.m = "BH")
+
+```
+
+#### Heat trees: Compare eukaryotic communities between the two heatwaves
+Use heat trees to visualize significant differences in eukaryotic communities between heatwave years, as determined using wilcoxon rank sum test. Used spring and summer data only, across both sites (P20 and P26) to represent the whole of the Northeast Subarctic Pacific (NESAP) Gyre.
+
+```{R eukaryotic heat tree, warning = FALSE} 
+osp_eukG <- osp_euks_fix %>% tax_agg(rank = "Genus") #collapse ASV table to genus 
+
+#### P26 and P20, spring and summer only - MANUSCRIPT FIGURE COMPONENT ####
+
+euks_p20p26<-osp_eukG %>% 
+  subset_samples(Month != "2") %>%
+  # subset_samples(Station != "P20") %>%
+  phyloseq_filter_prevalence(
+  prev.trh = 0.02,
+  abund.trh = NULL,
+  threshold_condition = "OR",
+  abund.type = "total"
+) %>% phyloseq_filter_taxa_rel_abund(frac = 5e-04)
+
+eobj3<-parse_phyloseq(euks_p20p26)
+
+#obj3 - p20p26
+eobj3$data$otu_table_props <- calc_obs_props(eobj3, data = "otu_table", cols = eobj3$data$sample_data$sample_id) #Converting counts to proportions
+
+eobj3$data$tax_ab <- calc_taxon_abund(eobj3, "otu_table", cols = eobj3$data$sample_data$sample_id, groups = rep("total_count", nrow(eobj3$data$sample_data))) #Sum observation values for each taxon (and subtaxon; proteobacteria and also gammaproteobacteria, etc.)
+
+# Plot total count
+set.seed(1)
+heat_tree(eobj3, node_label = taxon_names, node_size = total_count, node_color = total_count)
+
+
+#Calculating abundance per taxon
+eobj3$data$tax_prop <- calc_taxon_abund(eobj3, "otu_table_props", cols = eobj3$data$sample_data$sample_id) #now this calculates the proportions of each taxon (from domain to each unique genus) within each sample.  
+
+#For a given table in a taxmap object, split columns by a grouping factor and return row means in a table.
+eobj3$data$type_mean<- calc_group_mean(eobj3, "tax_prop",
+                                       cols = eobj3$data$sample_data$sample_id,
+                                       groups = eobj3$data$sample_data$MHW_WC)
+
+eobj3$data$type_mean_groups<- calc_group_mean(eobj3, "tax_prop",
+                                       cols = eobj3$data$sample_data$sample_id,
+                                       groups = eobj3$data$sample_data$MHW)
+
+eobj3$data$type_mean_wc<- calc_group_mean(eobj3, "tax_prop",
+                                       cols = eobj3$data$sample_data$sample_id,
+                                       groups = eobj3$data$sample_data$WC)
+
+#For a given table in a taxmap object, split columns by a grouping factor and return row means in a table. in this case the grouping factor is just the whole dataset to get the dataset mean. this will be useful for scaling the nodes.
+eobj3$data$mean_all <- calc_group_mean(eobj3, "tax_prop",
+                                       cols = eobj3$data$sample_data$sample_id,
+                                       groups =  rep("mean", nrow(eobj3$data$sample_data)))
+
+#compare groups, statistically. Apply a function to compare data, usually abundance, from pairs of treatments/groups. By default, every pairwise combination of treatments are compared. 
+
+
+eobj3$data$diff_table <- eobj3 %>% 
+  # filter_taxa(taxon_ranks == "Level6", supertaxa = TRUE) %>%
+  compare_groups(eobj3, dataset = "tax_prop",
+                 cols = eobj3$data$sample_data$sample_id, # What columns of sample data to use
+                 groups = eobj3$data$sample_data$MHW_WC,
+                 combinations = list(c('MHW1-SML','MHW2-SML'),
+                                     c('MHW1-UMP', 'MHW2-UMP')))
+
+#now, adjust for multiple comparisons using Benjamini & Hochberg correction. anything that is not significant is turned to 0 so that not colors will be mapped to the heat tree.
+eobj3 <- mutate_obs(eobj3, "diff_table",
+                       wilcox_p_value = p.adjust(wilcox_p_value, method = "BH"),
+                       log2_median_ratio = ifelse(wilcox_p_value < 0.05 | is.na(wilcox_p_value), log2_median_ratio, 0))
+
+taxons_to_keep3<-filter(eobj3$data$diff_table, log2_median_ratio != 0)
+to_label3<-c(taxons_to_keep3$taxon_id)
+
+set.seed(1)
+heattree_euk3_sig_SMLnodes<-eobj3 %>%
+heat_tree_matrix(
+                 data = "diff_table",
+                 node_size = eobj3$data$type_mean_wc[['SML']], # n_obs is a function that calculates, in this case, the number of OTUs per taxon
+                 node_label = ifelse(taxon_ids %in% to_label3, taxon_names, ''),
+                 node_color = log2_median_ratio, # A column from `obj$data$diff_table`
+                 node_color_range = diverging_palette(),
+                 # node_color_range = c("#0F4392", "gray", "#FF4949"),
+                 node_color_trans = "area", # The default is scaled by circle area
+                 node_color_interval = c(-3, 3), # The range of `log2_median_ratio` to display
+                 edge_color_interval = c(-3, 3), # The range of `log2_median_ratio` to display
+                 # row_label_color = "#FF4949",
+                 # col_label_color = "#0F4392",
+                 node_size_trans = "area",
+                 node_size_range = c(0.005,0.04),
+                 node_label_size_range = c(0.01, 0.04),
+                 node_size_interval = c(0,1),
+                 # label_small_trees = TRUE,
+                 node_size_axis_label = "Average Relative Abundance",
+                 node_color_axis_label = "Log2 ratio median proportions",
+                 layout = "reingold-tilford", # The primary layout algorithm
+                 initial_layout = "reingold-tilford") 
+
+heattree_euk3_sig_SMLnodes
+
+set.seed(1)
+heattree_euk3_sig_UMPnodes<-eobj3 %>%
+heat_tree_matrix(
+                 data = "diff_table",
+                 node_size = eobj3$data$type_mean_wc[['UMP']], # n_obs is a function that calculates, in this case, the number of OTUs per taxon
+                 node_label = ifelse(taxon_ids %in% to_label3, taxon_names, ''),
+                 # node_label = taxon_names,
+                 node_color = log2_median_ratio, # A column from `obj$data$diff_table`
+                 node_color_range = diverging_palette(),
+                 # node_color_range = c("#0F4392", "gray", "#FF4949"),
+                 node_color_trans = "area", # The default is scaled by circle area
+                 node_color_interval = c(-3, 3), # The range of `log2_median_ratio` to display
+                 edge_color_interval = c(-3, 3), # The range of `log2_median_ratio` to display
+                 # row_label_color = "#FF4949",
+                 # col_label_color = "#0F4392",
+                 node_size_trans = "area",
+                 node_size_interval = c(0,1),
+                 node_size_range = c(0.005,0.04),
+                 node_label_size_range = c(0.01, 0.04),
+                 # label_small_trees = TRUE,
+                 node_size_axis_label = "Average Relative Abundance",
+                 node_color_axis_label = "Log2 ratio median proportions",
+                 layout = "reingold-tilford", # The primary layout algorithm
+                 initial_layout = "reingold-tilford") 
+
+heattree_euk3_sig_UMPnodes
+
+# ggsave("heat-trees/heattree_euk_sig_SMLnodes-P20P26-springsummer-updatednodes.pdf", heattree_euk3_sig_SMLnodes, height = 8, width = 8, units = "in")
+# 
+# ggsave("heat-trees/heattree_euk_sig_UMPnodes-P20P26-springsummer-updatednodes.pdf", heattree_euk3_sig_UMPnodes, height = 8, width = 8, units = "in")
+
+#the above two files were then opened in adobe illustrator and the MHW1-UMP vs MHW2-UMP heat tree with nodes sized to average relative abundance in the upper mesopelagic (from this file: heattree_euk_sig_UMPnodes-P20P26-springsummer-fixednodes.pdf) was combined with the MHW1-SML vs MHW2-SML heat tree with nodes sized to average relative abundance in the surface mixed layer (from this file: heattree_euk_sig_SMLnodes-P20P26-springsummer-fixednodes.pdf) for the eukaryotic portion of this figure for the manuscript.
+
+```
+
+#### Eukaryotic heatmaps
+
+A panel of class and genus level heatmaps (generated below; merged together in Illustrator) was made for visualizing differences in eukaryotic communities with depth across time.
+
+```{R eukaryotic heatmap, warning = FALSE}
+#recall color palettes
+#MHWcols_full_BGCmatch
+#depthblue
+
+#### Phylum heatmap ####
+euk_phy_htmp<-osp_euks_fix %>%
+  ps_seriate(rank = "Phylum", tax_transform = "compositional", dist = "bray") %>%
+  tax_transform("compositional", rank = "Phylum") %>%
+  comp_heatmap(
+    taxa = tax_top(osp_euks_fix, 15, by = sum, rank = "Phylum"),
+    sample_anno = sampleAnnotation(
+     "Depth" = anno_sample_cat(var = "Depth", col = c("10" = "#c7e9b4","25" = "#7fcdbb","50"="#41b6c4","100" = "#1d91c0","150" ="#225ea8" ,"200"= "#253494","300" = "#081d58"), legend_title = "Depth"),
+      "Station" = anno_sample_cat(var = "Station", legend_title = "Station"),
+      "Month" = anno_sample_cat(var = "Month", col = c("2" = "#124076", "6" = "#7F9F80", "8" = "#F9E897"), legend_title = "Month"),
+     "Year" = anno_sample_cat(var = "Year", col = c("2015" = "indianred", "2016" = "#A9A6CF", "2017" = "#9390C3","2018" ="#7E7AB8","2019"= "darkred"), legend_title = "Year")
+    ),
+    sample_seriation = "Identity" # suppress sample reordering
+  )
+
+euk_phy_htmp %>% ComplexHeatmap::draw(
+  annotation_legend_list = attr(euk_phy_htmp, "AnnoLegends")
+)
+
+#### Class heatmap ####
+euk_cls_htmp<-osp_euks_fix %>%
+  ps_seriate(rank = "Class", tax_transform = "compositional", dist = "bray") %>%
+  tax_transform("compositional", rank = "Class") %>%
+  comp_heatmap(
+    taxa = tax_top(osp_euks_fix, 15, by = sum, rank = "Class"),
+    sample_anno = sampleAnnotation(
+     "Depth" = anno_sample_cat(var = "Depth", col = c("10" = "#c7e9b4","25" = "#7fcdbb","50"="#41b6c4","100" = "#1d91c0","150" ="#225ea8" ,"200"= "#253494","300" = "#081d58"), legend_title = "Depth"),
+      "Station" = anno_sample_cat(var = "Station", legend_title = "Station"),
+      "Month" = anno_sample_cat(var = "Month", col = c("2" = "#124076", "6" = "#7F9F80", "8" = "#F9E897"), legend_title = "Month"),
+     "Year" = anno_sample_cat(var = "Year", col = c("2015" = "indianred", "2016" = "#A9A6CF", "2017" = "#9390C3","2018" ="#7E7AB8","2019"= "darkred"), legend_title = "Year")
+    ),
+    sample_seriation = "Identity"
+    # tax_seriation = "OLO_ward"# suppress sample reordering
+  )
+
+euk_cls_htmp %>% ComplexHeatmap::draw(
+  annotation_legend_list = attr(euk_phy_htmp, "AnnoLegends")
+)
+
+# pdf(file="heatmaps/euk_cls_htmp.pdf",width=9,height=4)
+# euk_cls_htmp %>% ComplexHeatmap::draw(
+#   annotation_legend_list = attr(euk_phy_htmp, "AnnoLegends")
+# )
+#  dev.off() 
+
+#### Order heatmap ####
+euk_ord_htmp<-osp_euks_fix %>%
+  ps_seriate(rank = "Order", tax_transform = "compositional", dist = "bray") %>%
+  tax_transform("compositional", rank = "Order") %>%
+  comp_heatmap(
+    taxa = tax_top(osp_euks_fix, 30, by = sum, rank = "Order"),
+    sample_anno = sampleAnnotation(
+      "Depth" = anno_sample_cat(var = "Depth", col = c("10" = "#c7e9b4","25" = "#7fcdbb","50"="#41b6c4","100" = "#1d91c0","150" ="#225ea8" ,"200"= "#253494","300" = "#081d58"), legend_title = "Depth",size = grid::unit(2, "mm")),
+      "Station" = anno_sample_cat(var = "Station", legend_title = "Station",size = grid::unit(2, "mm")),
+      "Month" = anno_sample_cat(var = "Month", col = c("2" = "#124076", "6" = "#7F9F80", "8" = "#F9E897"), legend_title = "Month",size = grid::unit(2, "mm")),
+       "Year" = anno_sample_cat(var = "Year", col = c("2015" = "indianred", "2016" = "#A9A6CF", "2017" = "#9390C3","2018" ="#7E7AB8","2019"= "darkred"), legend_title = "Year",size = grid::unit(2, "mm"))
+    ),
+    sample_seriation = "Identity"# suppress sample reordering
+    # tax_seriation = "Identity" 
+  )
+
+euk_ord_htmp %>% ComplexHeatmap::draw(
+  annotation_legend_list = attr(euk_ord_htmp, "AnnoLegends")
+)
+  
+# pdf(file="heatmaps/euk_ord_htmp.pdf",width=9,height=4)
+# euk_ord_htmp %>% ComplexHeatmap::draw(
+#   annotation_legend_list = attr(euk_ord_htmp, "AnnoLegends")
+# )
+#  dev.off() 
+
+#### Genus heatmap ####
+
+euk_gen_htmp<-osp_euks_fix %>%
+  ps_seriate(rank = "Genus", tax_transform = "compositional", dist = "bray") %>%
+  tax_transform("compositional", rank = "Genus") %>%
+  comp_heatmap(
+    taxa = tax_top(osp_euks_fix, 30, by = sum, rank = "Genus"),
+    sample_anno = sampleAnnotation(
+      "Depth" = anno_sample_cat(var = "Depth", col = c("10" = "#c7e9b4","25" = "#7fcdbb","50"="#41b6c4","100" = "#1d91c0","150" ="#225ea8" ,"200"= "#253494","300" = "#081d58"), legend_title = "Depth",size = grid::unit(2, "mm")),
+      "Station" = anno_sample_cat(var = "Station", legend_title = "Station",size = grid::unit(2, "mm")),
+      "Month" = anno_sample_cat(var = "Month", col = c("2" = "#124076", "6" = "#7F9F80", "8" = "#F9E897"), legend_title = "Month",size = grid::unit(2, "mm")),
+       "Year" = anno_sample_cat(var = "Year", col = c("2015" = "indianred", "2016" = "#A9A6CF", "2017" = "#9390C3","2018" ="#7E7AB8","2019"= "darkred"), legend_title = "Year", size = grid::unit(2, "mm"))
+    ),
+    sample_seriation = "Identity" # suppress sample reordering
+  )
+
+euk_gen_htmp %>% ComplexHeatmap::draw(
+  annotation_legend_list = attr(euk_gen_htmp, "AnnoLegends")
+)
+
+# pdf(file="heatmaps/euk_gen_htmp.pdf",width=9,height=4)
+# euk_gen_htmp %>% ComplexHeatmap::draw(
+#   annotation_legend_list = attr(euk_gen_htmp, "AnnoLegends")
+# )
+#  dev.off() 
+
+```
