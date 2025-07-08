@@ -1,0 +1,29 @@
+---
+title: "Fig.S12b"
+author: "Sachia"
+date: "2025-06-17"
+output:
+  pdf_document: default
+  html_document: default
+---
+Regarding Figure S12b.
+Reviewer: "Spatial variability could be as large as the interannual variability"
+
+What we originally wrote: "The magnitude of NCP was similar among floats that overlapped in time."
+
+We run a linear mixed-effects model with year and float ID as random effects. 
+
+Results: most of the variability is attributed year-to-year changes, not spatial (at the float level) differences. (The model associated zero variance to float ID). 
+
+```{r}
+S12b <- read.delim("aNCP_export_spring_summer.txt", sep = " ")
+
+# Linear mixed-effects model
+library(lme4)
+library(Matrix)
+model.S12b <- lmer(aNCP_carbon_unit ~ (1 | year) + (1 | WMOID), data = S12b)
+summary(model.S12b)
+```
+
+Year is a major driver of the recorded aNCP variability, since the std.dev is ~0.9.
+float ID does not explain any additional variance. (The Variance is 0.0000) -> NCP is similar among floats that overlap in time.
