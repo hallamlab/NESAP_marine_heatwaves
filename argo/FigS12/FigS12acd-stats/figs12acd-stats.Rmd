@@ -1,0 +1,329 @@
+---
+title: "FigS12 stats"
+author: "Colleen Kellogg"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(R.matlab)
+library(pracma)  
+library(Hmisc)
+library(rstatix)
+library(ggpubr)
+
+# tinytex::install_tinytex()
+options(tinytex.verbose = TRUE) 
+```
+
+## Spatiotemporal senstivity analysis
+
+In response to reviewer #1's concerns regarding spatio-temporal variability and Argo data we added a thorough statistical analysis regarding spatial variability. A new section was added to the Methods, titled “Spatiotemporal sensitivity analyses”, which details the approach and results. To back up the statements and observations made in Fig. S12, below are several statistical tests to support the statements made surrounding S12a, S12c, and S12c
+
+ 
+### Stats for Fig S12a:
+Correlation test to support the statement that "Profiles collected within three days of each other showed a strong positive correlation in integrated Chl over the upper 100m".
+
+
+```{R stats for fig S12a }
+# Stats for fig S12a 
+# library to read matlab data formats into R
+
+# read in our data
+chlmat <- readMat("chla_NEPac_processed.mat")
+
+# check out data structure
+str(chlmat)
+
+chla_small <- chlmat$chla1
+press1 <- chlmat$press1
+datet <- chlmat$datet
+floatn <- chlmat$floatn
+
+# Find overlapping dates within 3 days for different floats
+overlap_indices <- matrix(ncol = 2, nrow = 0)
+for (i in 1:length(datet)) {
+  for (j in (i+1):length(datet)) {
+    if (j <= length(datet) && abs(datet[i] - datet[j]) <= 3 && floatn[i] != floatn[j]) {
+      overlap_indices <- rbind(overlap_indices, c(i, j))
+    }
+  }
+}
+
+# Extract overlapping data
+float1_data <- chla_small[, overlap_indices[, 1]]
+float2_data <- chla_small[, overlap_indices[, 2]]
+press1_data <- press1[, overlap_indices[, 1]]
+press2_data <- press1[, overlap_indices[, 2]]
+
+# Initialize vectors to store integrated values
+integrated_float1 <- c()
+integrated_float2 <- c()
+
+# Integrate float1_data and float2_data values for rows where press1_data < 100
+for (col in 1:ncol(press1_data)) {
+  rows_to_integrate_float1 <- which(press1_data[, col] < 100)
+  rows_to_integrate_float2 <- which(press2_data[, col] < 100)
+
+# Use pracma package for trapz function, or implement trapezoidal rule
+# If pracma is available: library(pracma)
+integrated_float1 <- c(integrated_float1, trapz(1:length(rows_to_integrate_float1), float1_data[rows_to_integrate_float1, col]))
+integrated_float2 <- c(integrated_float2, trapz(1:length(rows_to_integrate_float2), float2_data[rows_to_integrate_float2, col]))
+
+}
+
+# Get the corresponding float numbers for labeling
+float_num_1 <- floatn[overlap_indices[1, 1]]
+float_num_2 <- floatn[overlap_indices[1, 2]]
+
+# Create figure with scatter plot and linear fit
+
+
+# Sanity check - Scatter plot 1: Integrated Float Data with linear fit. 
+plot(integrated_float1, integrated_float2, 
+     pch = 19, cex = 1.2, col = "black",
+     xlab = paste("Chl (mg m^-^3) float #", float_num_1),
+     ylab = paste("Chl (mg m^-^3) float #", float_num_2),
+     main = "Integrated Float Data Comparison")
+
+
+# Add linear fit line
+fit <- lm(integrated_float2 ~ integrated_float1)
+abline(fit, col = rgb(0.75, 0.75, 0), lwd = 2)  # Dark yellow line
+
+
+#correlation 
+
+tocompare_mat<-cbind(integrated_float1,integrated_float2)
+s12a_mat_corr<-rcorr(tocompare_mat, type = "pearson")
+s12a_mat_corr
+s12a_mat_corr$P
+s12a_mat_corr$r
+
+#Pearson correlation results:  (r(84) = 0.70, P< 0.0001)
+
+```
+
+### Stats for Fig S12c:
+
+To support the statement "we examined spatial variability in surface chlorophyll using monthly mean concentrations from the Aqua-MODIS satellite product (4 km resolution, 2008-2023) across four Line P stations located within the float trajectories." we used both a pearson correlation analysis as well as a repeated measures anova to determine if how well the satellite data corresponded across all locations and whether it differed significantly within a time point, across all stations.
+
+
+```{r stats for fig S12c}
+# Stats for fig S12c
+# load data
+monthly<-read_csv("climate_monthly_2008-2023.csv")
+
+#sanity check: make a plot and ensure it looks like what matlab code produced.
+ggplot(monthly, aes(x = Month, y = chlor_a, group = Station, color = Station)) +
+  geom_line() + labs(color = "Station", y = "Chla (mg m3)") + theme_classic()
+
+#prepare for stats
+
+monthly$Month = as.factor(monthly$Month)
+monthly$Station = as.factor(monthly$Station)
+
+monthly
+
+#first lets do a correlation matrix
+s12c_subset<-monthly %>% select(Station, Month, chlor_a) %>% pivot_wider(values_from = chlor_a, names_from = Station)
+s12c_corr<-rcorr(as.matrix(s12c_subset[2:6]), type = c("pearson","spearman"))
+
+# Extract the correlation coefficients
+s12c_corr$r
+# Extract p-values
+pvalues<-s12c_corr$P
+
+# Example using Bonferroni correction
+adjusted_p_values_bonferroni <- p.adjust(pvalues, method = "bonferroni")
+
+library("PerformanceAnalytics")
+# jpeg("figs12c-correlation-chart.jpg", width = 6, height = 7, units = "in", res = 300)
+chart.Correlation(s12c_subset[2:6], histogram=TRUE, pch=19)
+# dev.off()
+
+
+# results - Chlorophyll a concentrations co-vary. R2 ranges from 0.85 to 0.98 with p-values <0.001 (<0.05 if bonferroni adjusted)
+
+#But what about within a month
+
+aov(formula = chlor_a ~ Month, data = monthly)
+aov(formula = chlor_a ~ Month, data = monthly)
+
+monthly %>%
+  group_by(Station) %>%
+  get_summary_stats(chlor_a, type = "mean_sd")
+
+#check for outliers
+monthly %>%
+  group_by(Station) %>%
+  identify_outliers(chlor_a)
+
+monthly %>%
+  group_by(Month) %>%
+  identify_outliers(chlor_a)
+
+#there is an extreme outlier P25, October - higher than other stations. but since we focused on spring and summer, this should not affect our conclusions.
+
+#normality assumption
+monthly %>%
+   group_by(Station) %>%
+  shapiro_test(chlor_a)
+
+monthly %>%
+   group_by(Month) %>%
+  shapiro_test(chlor_a)
+
+#months 10 and 11 have a pvalue of 0.02 and 0.038; rejecting the assumption of normality.
+
+ggqqplot(monthly, "chlor_a", facet.by = "Month")
+
+#repeated measures anova
+
+res.aov <- anova_test(data = monthly, dv = chlor_a, wid = Station, within = Month)
+get_anova_table(res.aov) #significantly different at different timepoints. this makes sense. 
+
+####
+# ANOVA Table (type III tests)
+# 
+#   Effect DFn DFd      F        p p<.05   ges
+# 1  Month  10  40 39.229 1.56e-17     * 0.892
+####
+
+res.aov2 <- anova_test(data = monthly, dv = chlor_a, wid = Month, within = Station)
+get_anova_table(res.aov2) #but if we flip this around there is not a significant difference among stations, within a timepoint.
+
+#####
+# ANOVA Table (type III tests)
+# 
+#    Effect  DFn   DFd     F    p p<.05   ges
+# 1 Station 2.18 21.75 1.841 0.18       0.017
+#####
+
+```
+
+
+### Stats for Fig S12d:
+
+Finally, we looked at discrete Tchla samples collected on Line P cruises. 
+We made the statement: "Discrete chlorophyll samples collected during Line P cruises further confirmed these seasonal trends (Fig. S12d)". 
+
+```{r stats for fig S12d}
+# Stats for fig S12d
+# load data
+chlbtl_all<-read_csv("forMarianaB_PhytoComposition_avg-rev-cat.csv")
+
+chlbtl<-chlbtl_all %>% subset(TimeofYear %in% c("Spring","Summer","Winter"))
+
+chlbtl$Date <- as_date(chlbtl$Date)
+
+chlbtl$Date <- strftime(chlbtl$Date,format="%Y-%m")
+
+#make a plot or two or three. 
+#reproduce matlab version s12d
+ggplot(chlbtl, aes(x = Date, y = Tchl_a, group = Station, color = Station)) +
+  geom_point() + geom_line() + labs(color = "Station", y = "Chla (mg/m3)") + theme_classic() + theme(axis.text.x = element_text(angle = 60, hjust = 1)) + scale_color_manual(values = c("#1171BE","#DD5400","#F6D88F","#8516D1"))
+
+#but let's plot the data a few others ways to just explore.
+#plotted by year-season
+ggplot(chlbtl, aes(x = YearSeason, y = Tchl_a, group = Station, color = Station)) +
+  geom_point() + geom_line() + labs(color = "Station", y = "Chla (mg/m3)") + theme_classic() + theme(axis.text.x = element_text(angle = 60, hjust = 1)) + scale_color_manual(values = c("#1171BE","#DD5400","#F6D88F","#8516D1"))
+
+#stacked, date
+ggplot(chlbtl, aes(x = Date, y = Tchl_a, group = Station, color = Station)) +
+  geom_point() + geom_line() + labs(color = "Station", y = "Chla (mg/m3)") + theme_classic() + theme(axis.text.x = element_text(angle = 60, hjust = 1)) + facet_grid(Station~.) + scale_color_manual(values = c("#1171BE","#DD5400","#F6D88F","#8516D1"))
+
+#stacked, year-season
+ggplot(chlbtl, aes(x = YearSeason, y = Tchl_a, group = Station, color = Station)) +
+  geom_point() + geom_line() + labs(color = "Station", y = "Chla (mg/m3)") + theme_classic() + theme(axis.text.x = element_text(angle = 60, hjust = 1)) + facet_grid(Station~.)+ scale_color_manual(values = c("#1171BE","#DD5400","#F6D88F","#8516D1"))
+
+#boxplot to see variability within each cruise/season a bit more clearly.
+ggplot(chlbtl, aes(x = YearSeason, y = Tchl_a, group = YearSeason)) +
+  geom_boxplot() + geom_jitter(aes(color = Station),width = 0.2) + labs(color = "Station", y = "Chla (mg/m3)") + theme_classic() + theme(axis.text.x = element_text(angle = 60, hjust = 1)) + xlab(NULL) + scale_color_manual(values = c("#1171BE","#DD5400","#F6D88F","#8516D1"))
+
+#prepare for stats
+
+chlbtl$Month = as.factor(chlbtl$Month)
+
+chlbtl
+
+#first lets do a correlation matrix
+library(Hmisc)
+s12d_subset<-chlbtl %>% select(Station, Date, TimeofYear, YearSeason,Tchl_a) %>% pivot_wider(values_from = Tchl_a, names_from = Station)
+s12d_corr_pear<-rcorr(as.matrix(s12d_subset[4:7]), type = "pearson")
+s12d_corr_spear<-rcorr(as.matrix(s12d_subset[4:7]), type = "spearman")
+
+#subset spring and summer, as that was the focus of the comparison in the paper
+s12d_subset_ss<-s12d_subset %>% filter(TimeofYear %in% c("Spring","Summer"))
+
+s12d_corr_sssp<-rcorr(as.matrix(s12d_subset_ss[4:7]), type ="spearman")
+s12d_corr_ssp<-rcorr(as.matrix(s12d_subset_ss[4:7]), type ="pearson")
+
+s12d_corr_sssp$r
+s12d_corr_ssp$r
+s12d_corr_sssp$P
+s12d_corr_ssp$P
+
+# Extract p-values
+pvalues_12d<-s12d_corr_sssp$P
+# pvalues_11d<-s11d_corr_ssp$P
+
+# Example using Bonferroni correction
+adjusted_p_values_bonferroni <- p.adjust(pvalues_12d, method = "bonferroni")
+
+#test normality assumptions
+#normality assumption ; rejected with exception of P25
+chlbtl %>%
+   group_by(Station) %>%
+  shapiro_test(Tchl_a)
+
+#normality assumption ; rejected with exception of winter
+chlbtl %>%
+  group_by(TimeofYear) %>%
+  shapiro_test(Tchl_a)
+
+#so probably best to use Spearman.
+
+library("PerformanceAnalytics")
+# chart.Correlation(s12d_subset_ss[4:7], histogram=TRUE, pch=19, method = "pearson")
+chart.Correlation(s12d_subset_ss[4:7], histogram=TRUE, pch=19, method = "spearman")
+
+#P24 and P25 correlated (0.89) and P21 and P22 correlated (0.77) P22 and P24 also, but weaker (0.56, 0.05). 
+
+chlbtl %>%
+  group_by(Station) %>%
+  get_summary_stats(Tchl_a, type = "mean_sd")
+
+#check for outliers
+
+chlbtl %>%
+  group_by(Station) %>%
+  identify_outliers(Tchl_a)
+
+#there is an extreme outlier P22, 2019-06 - higher than other stations.
+
+chlbtl %>%
+  group_by(TimeofYear) %>%
+  identify_outliers(Tchl_a)
+
+
+#normality assumption ; rejected. 
+chlbtl %>%
+   group_by(Station) %>%
+  shapiro_test(Tchl_a) #only p25 is normal
+
+chlbtl %>%
+  group_by(TimeofYear) %>%
+  shapiro_test(Tchl_a) #only winter is normal
+
+ggqqplot(chlbtl, "Tchl_a", facet.by = "TimeofYear")
+
+
+
+```
+
+
+Given the results above, we can say the following to inform that statement:
+While individual profiles were strongly correlated regionally (P21 and P22, rho(28)= 0.77, adjusted P(Bonferroni)< 0.001; P24 and P25, rho(27) = 0.89, adjusted P(Bonferroni)< 0.001), there was weaker correspondence between more distant stations, reflecting the inherently patchy nature of chlorophyll distributions, these results collectively indicate that the observed trends in POC production and accumulation were not driven by float-specific or spatial biases.
